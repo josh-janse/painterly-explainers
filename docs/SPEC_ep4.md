@@ -521,3 +521,1307 @@ faint darker stains (plaster-like blotches visible in the plates). Base colours:
 pink `#f0aaba` (240,170,186), cream `#e2dbce` (226,219,206) (canvas fills); final plate means measured in the video:
 yellow (236–238, 211–214, 143–145), pink (229–237, 160–166, 176–181), cream (215–221, 209–213, 197–201).
 
+---
+
+## 4. Video — `ep4_video.py`
+
+### 4.1 Structure
+
+- Module top: `import math, os, sys, subprocess, numpy as np, scipy.ndimage as ndi, PIL (Image, ImageDraw, ImageFont, ImageFilter)`;
+  `from ep4_timeline import *`; `W, H = 1920, 1080`; `FPS = 24`; `A` = folder holding the backdrop outputs
+  (`out/`); `rng = np.random.default_rng(<seed>)`; `F = 1.5`; easing helpers (§1.2).
+- `load(name)` → float32 RGB 0–1 array of `A/name` (resized to W×H if needed).
+- `font(key, px)` → cached `ImageFont.truetype("fonts/<key>.ttf", int(px))`.
+- `comp(base, lay)` → `Image.fromarray(uint8(base*255)).convert("RGBA")` alpha-composited with the RGBA overlay `lay`
+  (W×H); returns a PIL RGBA image. Scenes return float32 RGB arrays (`np.asarray(im.convert("RGB"), np.float32)/255`).
+- `frame(t)` dispatches on the timeline (§4.10) and returns float32 RGB; the main loop renders `n = round(t0*24) …`,
+  converts to uint8 and pipes raw RGB to one `ffmpeg -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 24 -i - -c:v libx264 …`
+  process (*inferred*), printing progress every 5 s.
+- Global load (*recovered fragment*, lines 25–43, plus the land-mask edit):
+
+```python
+DUSK, NIGHT, UNCLE = load("dusk.jpg"), load("night.jpg"), load("uncle.jpg")
+YEL, PINK, CREAM = load("paper_yellow.jpg"), load("paper_pink.jpg"), load("paper_cream.jpg")
+MD = np.load(os.path.join(A, "dusk_masks.npz")); MN = np.load(os.path.join(A, "night_masks.npz"))
+
+def prep_masks(m):
+    land = np.asarray(Image.fromarray(m["land"]).resize((W, H), Image.BILINEAR), np.float32) / 255
+    land = ndi.gaussian_filter(land, 2)
+    hz = float(m["hz"]); wx, wy = m["win"] * np.array([W, H])
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    glow = np.exp(-(((xx - wx) ** 2 + (yy - wy) ** 2) / (2 * 40.0 ** 2)))
+    # the cottage, chimney and smoke stand above the hill line: pin them to the land so the sky can't drag them
+    house = ((np.abs(xx - wx) < 60) & (yy > wy - 110) & (yy < wy + 30)).astype(np.float32)
+    # (no box around the house any more: only the cloud layer drifts, and the house and smoke sit in the still layer)
+    return dict(land=land, hz=hz, win=(wx, wy), glow=glow)
+KD, KN = prep_masks(MD), prep_masks(MN)
+# clouds as their own layer: full render minus the cloudless render, so they can drift over a still sky
+KD["nc"], KN["nc"] = load("dusk_nc.jpg"), load("night_nc.jpg")
+KD["cloud"], KN["cloud"] = DUSK - KD["nc"], NIGHT - KN["nc"]
+LIGHT_D = DUSK - load("dusk_off.jpg")     # the lit window, its glow and reflection, so the light can come on
+```
+
+  `KD_win`, `KN_win` = `KD["win"]`, `KN["win"]` (px; dusk ≈ (1501, 488)). The `house` array is computed but unused (left over).
+
+### 4.2 Sea and sky motion (dusk s1–s2 and night s8)
+
+#### 4.2.1 Row shifters (*recovered*)
+
+```python
+COLS = np.arange(W)
+def shift_rows(img, rows, dx):
+    """shift each listed row horizontally by dx (float, px), linear-interpolated, edges clamped"""
+    src = COLS[None, :] - dx[:, None]
+    i0 = np.floor(src).astype(np.int32); f = (src - i0)[..., None]
+    i0c = np.clip(i0, 0, W - 1); i1c = np.clip(i0 + 1, 0, W - 1)
+    r = rows[:, None]
+    return img[r, i0c] * (1 - f) + img[r, i1c] * f
+
+def shift_rows_zero(img, rows, dx):
+    """like shift_rows, but what slides in from outside the frame is empty (for the cloud layer)"""
+    src = COLS[None, :] - dx[:, None]
+    i0 = np.floor(src).astype(np.int32); f = (src - i0)[..., None]
+    v0 = ((i0 >= 0) & (i0 < W))[..., None]; v1 = ((i0 + 1 >= 0) & (i0 + 1 < W))[..., None]
+    r = rows[:, None]
+    return img[r, np.clip(i0, 0, W - 1)] * (1 - f) * v0 + img[r, np.clip(i0 + 1, 0, W - 1)] * f * v1
+```
+
+(`shift_rows_zero` was the v7 cloud drift; v8+ uses `cloud_layer`.)
+
+#### 4.2.2 `cloud_layer` — drifting and slowly reshaping clouds (*recovered fragment, v8*)
+
+```python
+_CW = {}
+def cloud_layer(K, rows, t, hzp):
+    """the cloud wisps drift left (faster high up) and slowly change shape: two smooth displacement fields swap in
+    and out, so the strokes stretch and thin a little as they travel, the way cloud does at dusk"""
+    key = (id(K), len(rows))
+    if key not in _CW:
+        r = np.random.default_rng(77)
+        f = [ndi.gaussian_filter(r.standard_normal((len(rows), W)).astype(np.float32), (40, 90)) for _ in range(4)]
+        f = [x / (x.std() + 1e-6) for x in f]
+        _CW[key] = (f, np.arange(len(rows), dtype=np.float32)[:, None], COLS[None, :].astype(np.float32))
+    f, ys, xs = _CW[key]
+    drift = -(t * 12.0) * (1.3 - 0.6 * ys / hzp)                       # px: about 12 px/s, a little faster high up
+    a1, a2 = math.sin(t * 0.55), math.cos(t * 0.41 + 0.7)
+    wx = 7.0 * (a1 * f[0] + a2 * f[1]); wy = 2.2 * (a1 * f[2] + a2 * f[3])
+    sy, sx = ys - wy, xs - drift - wx
+    return np.stack([ndi.map_coordinates(K["cloud"][rows][..., c], [np.broadcast_to(sy, sx.shape), sx], order=1, mode="constant", cval=0.0)
+                     for c in range(3)], -1)
+```
+
+The cloud layer is a signed difference image (full − cloudless); `cval=0` means empty sky slides in from the right.
+
+#### 4.2.3 `glints` — twinkling flecks in the window's reflection (*recovered fragment, v9*; replaced the "chevron" sparkle the owner saw as downward arrows)
+
+```python
+_GL = {}
+def glints(K, hzp, y0, t, night):
+    key = (id(K), night)
+    if key not in _GL:
+        r = np.random.default_rng(91 if night else 90); n = 34 if night else 22; G = []
+        for _ in range(n):
+            d = r.uniform(0, 1) ** 1.6 * 0.5                            # depth: most near the horizon
+            y = hzp + 3 + d * (H - hzp); x = K["win"][0] + r.normal(0, 3 + 30 * d)
+            G.append((x, y, (3 + 16 * d) * r.uniform(0.6, 1.3), 0.7 + 1.6 * d, r.uniform(0, 6.28), r.uniform(1.2, 2.6), math.exp(-d / 0.45)))
+        _GL[key] = G
+    acc = np.zeros((H - y0, W), np.float32)
+    for x, y, hl, hh, ph, rate, k in _GL[key]:
+        b_ = max(0.0, math.sin(ph + t * rate)) ** 3 * k
+        if b_ < 0.02: continue
+        xa, xb = int(x - hl - 3), int(x + hl + 4); ya, yb = int(y - hh - 3) - y0, int(y + hh + 4) - y0
+        if ya < 0 or yb > acc.shape[0] or xa < 0 or xb > W: continue
+        gx = np.arange(xa, xb, dtype=np.float32)[None, :]; gy = np.arange(ya + y0, yb + y0, dtype=np.float32)[:, None]
+        acc[ya:yb, xa:xb] += b_ * np.exp(-((gx - x) / hl) ** 4) * np.exp(-((gy - y) / hh) ** 2)
+    return np.clip(acc, 0, 1.2)[..., None]
+```
+
+#### 4.2.4 `living_sea` — final v9 (*recovered, with the v8/v9 patches applied*)
+
+```python
+def living_sea(img, K, t, night=False, on=1.0):
+    """small movements for the painted sea scenes: drifting sky, swaying water, a flickering window"""
+    out = img.copy()
+    hzp = int(K["hz"] * H)
+    # sky: the cloud layer drifts and reshapes over the still cloudless sky; the land stays put
+    rows = np.arange(0, hzp + 2)
+    sky = K["nc"][rows] + cloud_layer(K, rows, t, hzp)
+    keep = K["land"][rows][..., None]
+    out[rows] = sky * (1 - keep) + img[rows] * keep
+    # water: rows sway sideways, more strongly toward the viewer, so strokes and reflections ripple
+    y0 = hzp + 2
+    ys = np.arange(y0, H, dtype=np.float32)[:, None]; xs = COLS[None, :].astype(np.float32)
+    depth = (ys - hzp) / (H - hzp)
+    dx = (1.0 + 6.5 * depth) * np.sin(ys * 0.06 + t * 1.5) + (0.6 + 3.0 * depth) * np.sin(ys * 0.019 - t * 0.9 + 1.3)
+    dy = (0.3 + 2.6 * depth) * np.sin(xs * 0.011 + ys * 0.045 + t * 1.25)       # a gentle swell, stronger near the viewer
+    sy = np.clip(ys + dy, y0, H - 1); sx = np.clip(xs - dx, 0, W - 1)
+    for c in range(3): out[y0:, :, c] = ndi.map_coordinates(img[..., c], [sy, sx], order=1)
+    # glints in the window's reflection: short horizontal flecks that wink on and off in place (stepped on twos).
+    # (The old version was a sine band bent by x, which read as chevrons sliding down the water.)
+    out[y0:] += glints(K, hzp, y0, twos(t), night) * np.array([0.30, 0.22, 0.09], np.float32)
+    # window: a soft flicker, stepped on twos
+    tt = twos(t)
+    fl = 0.05 * math.sin(tt * 7.3) + 0.03 * math.sin(tt * 17.1 + 1) + (0.04 if night else 0.0)
+    out = out * (1 + on * fl * K["glow"])[..., None] + on * K["glow"][..., None] * np.array([0.10, 0.07, 0.02], np.float32) * (0.5 + fl * 5) * (0.6 if not night else 1.0)
+    return np.clip(out, 0, 1)
+```
+
+Notes: `t` is the **scene clock** (s1/s2 use absolute t; s8 uses `lt = t − T["s8"][0]`) — never mix a global clock
+into the drift, or the house slides off its glow (a bug fixed in v6). Glints are additive light (gold) in the sea
+rows only. The window glow `K["glow"]` is a σ = 40 px Gaussian at the window.
+
+#### 4.2.5 Camera helpers
+
+```python
+# recovered fragment: push()
+def push(img_pil, t, dur, focus, amount=0.045):
+    """slow push-in toward a focus point (2.5D camera move on a still)"""
+    s = 1 + amount * ease_io(t / dur)
+    fx, fy = focus
+    w, h = W / s, H / s
+    x0 = min(max(fx - w * fx / W, 0), W - w); y0 = min(max(fy - h * fy / H, 0), H - h)
+    return img_pil.resize((W, H), Image.BICUBIC, box=(x0, y0, x0 + w, y0 + h))
+```
+
+Not recovered verbatim, behaviour fixed by usage (`def cam(im, s, cx, cy): return apply_box(im, cam_box(s, cx, cy))` is recovered):
+
+- `cam_box(s, cx, cy)` → `(x0, y0, s)`: a view `W/s × H/s` centred on source point `(cx, cy)`, clamped inside the
+  frame (`x0 ∈ [0, W − W/s]`, `y0 ∈ [0, H − H/s]`).
+- `push_box(t, dur, focus, amount)` → the same box `push()` uses: `s = 1 + amount·ease_io(t/dur)`, `w = W/s`,
+  `x0 = clamp(fx − w·fx/W)`, `y0 = clamp(fy − h·fy/H)`; returns `(x0, y0, s)`.
+- `apply_box(im, box)` → `im.resize((W, H), Image.BICUBIC, box=(x0, y0, x0 + W/s, y0 + H/s))`.
+- Screen mapping for overlays drawn after the camera: `to_screen(x, y) = ((x − x0)·s, (y − y0)·s)`.
+
+### 4.3 2.5D parallax (s1 tilt)
+
+The dusk plate is split into two planes. Far: the cloudless sky with the hill painted out (SKYFILL) and extended below
+the horizon. Near: hill + house + sea. During the tilt the near plane is shifted **down** by `dy = PARALLAX·(1−p)^1.5`
+source px (70 px at p=0 → 0 at p=1), so it rises faster than the sky as the camera tilts down.
+
+*Recovered fragment* (v9 final, including the `land_shape` change and the smooth inpaint that replaced the
+column-copy fill):
+
+```python
+# 2.5D: the dusk painting as two planes. Far: sky (hill painted out, extended below the horizon). Near: hill, house and sea.
+_hzp = int(KD["hz"] * H)
+_nc = KD["nc"]
+_land = ndi.gaussian_filter(np.asarray(Image.fromarray(MD["land_shape"] if "land_shape" in MD else MD["land"]).resize((W, H), Image.BILINEAR), np.float32) / 255, 2)   # hill only (its full outline, so the faded toe moves as one piece)
+_wx, _wy = KD["win"]; _yy0, _xx0 = np.mgrid[0:H, 0:W].astype(np.float32)
+_land = np.maximum(_land, ndi.gaussian_filter(((np.abs(_xx0 - _wx) < 30) & (_yy0 > _wy - 38) & (_yy0 < _wy + 14)).astype(np.float32), 1.2))   # + a tight house
+del _yy0, _xx0
+_landD = ndi.gaussian_filter(ndi.grey_dilation((_land > 0.02).astype(np.float32), size=(11, 11)), 1.5)
+# sky behind the hill: a smooth fill grown in from the surrounding sky (normalised convolution at a few scales), plus
+# paper/wash texture borrowed from the sky 150 px higher up. (The old column-copy fill left vertical streaks.)
+_hole = (_landD > 0.05).astype(np.float32); _hole[_hzp:] = 1.0
+_known = 1 - _hole
+SKYFILL = _nc * _known[..., None]; _filled = _known.copy()
+for _sg in (6, 16, 40, 100):
+    _num = ndi.gaussian_filter(_nc * _known[..., None], (_sg, _sg, 0)); _den = ndi.gaussian_filter(_known, _sg)[..., None]
+    _est = _num / np.maximum(_den, 1e-4); _w = np.clip(_den * 6, 0, 1) * (1 - _filled)[..., None]
+    SKYFILL = SKYFILL + _est * _w; _filled = np.clip(_filled + _w[..., 0], 0, 1)
+_detail = _nc - ndi.gaussian_filter(_nc, (5, 5, 0)); _src = np.roll(_detail, 150, axis=0)
+SKYFILL = SKYFILL + _src * (_hole * (np.arange(H)[:, None] < _hzp))[..., None]
+SKYFILL[_hzp:] = SKYFILL[_hzp - 2:_hzp - 1]
+SKYFILL = SKYFILL * (1 - _known[..., None]) + _nc * _known[..., None]
+del _num, _den, _est, _w, _detail, _src
+_rowsf = np.arange(H, dtype=np.float32)[:, None]
+NEAR_A = np.maximum(_land, np.clip(_rowsf - _hzp + 1, 0, 1))[..., None]          # hill + house + sea
+SKY_KEEP = ((1 - _landD) * (_rowsf < _hzp))[..., None]                             # live sky (moving clouds) where it is really sky
+def shift_down(a, dy):
+    """shift an image down by a fractional number of pixels (top filled with zeros)"""
+    i = int(math.floor(dy)); f = dy - i
+    def sh(n):
+        if n <= 0: return a
+        o = np.zeros_like(a); o[n:] = a[:-n]; return o
+    return sh(i) * (1 - f) + sh(i + 1) * f if f > 1e-3 else sh(i)
+def parallax(base, dy):
+    sky = base * SKY_KEEP + SKYFILL * (1 - SKY_KEEP)
+    if dy < 0.05: return base
+    na = shift_down(NEAR_A, dy); nb = shift_down(base, dy)
+    return sky * (1 - na) + nb * na
+```
+
+Known artefact: a faint vertical streak at the house is paint texture (it shows at the same level with parallax off) —
+acceptable.
+
+### 4.4 Scenes 1–2: `scene_dusk(t)` (one continuous shot, 0 → 17.50)
+
+#### 4.4.1 Recovered body (v7 form; the two tag lines changed later, see below)
+
+```python
+def scene_dusk(t, t_scene0=0):
+    """scenes 1 and 2 are one shot: high on the sky with gulls, tilt down to the sea and the house (the near plane rising
+    faster than the sky), the window lights, then a slow push in"""
+    on = ease_io((t - LIGHT_ON) / 0.5)
+    base = living_sea(DUSK - (1 - on) * LIGHT_D, KD, t, on=on)
+    if t < TILT[1]:
+        p = ease_io((t - TILT[0]) / (TILT[1] - TILT[0]))
+        base = parallax(base, PARALLAX * (1 - p) ** 1.5)
+        box = cam_box(2.0 - 1.0 * p, (0.32 + 0.18 * p) * W, (0.25 + 0.25 * p) * H)     # starts on sky only: hill, horizon and house out of shot
+    else:
+        box = push_box(t - TILT[1], T["s2"][1] - TILT[1], KD_win, 0.06)
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if t >= T["s2"][0] + FLY_OUT[0]:
+        u = ease_io(min(1, (twos(t) - T["s2"][0] - FLY_OUT[0]) / FLY_OUT[1]))
+        fly(lay, PATH_OUT, u, 260, 16, -14, -2, t, (243, 235, 224, 170))
+    im = apply_box(comp(base, lay), box)
+    x0, y0, sc = box
+    birds(im, t, lambda x, y: ((x - x0) * sc, (y - y0) * sc), sc)
+    if TITLE[0] <= t < TITLE[1]:
+        im.alpha_composite(title_reveal(t - TITLE[0], TITLE[1] - TITLE[0]))      # v8: was a static tag()
+    # v8: the "YOUR LETTER" tag became eyebrow(...), which returns an empty layer (EYEBROWS = False) — omit it entirely
+    return np.asarray(im.convert("RGB"), np.float32) / 255
+```
+
+Camera, worked out: at t ≤ 0.6 the box is zoom 2.0 centred (614.4, 270) → source rect x 134.4–1094.4, y 0–540
+(sky only; birds large). At t = 5.0 zoom 1.0 = full frame (horizon at y = 626, house at (1501, 488)). Then
+`push_box` from 5.0 to 17.50 pushes 6 % toward the window (house ends ≈ (1490, 476) on screen at 12 s, measured).
+
+Light-on: the window, its glow and its sea reflection fade in over 4.20–4.70 (`ease_io`), and the flicker scales with `on`.
+
+#### 4.4.2 Birds (painted gulls, screen space, after the camera)
+
+*Recovered*: `bird_sprite(span, wy)` draws two tapered brush-stroke wings plus a small body at 4× supersampling,
+cached; `birds(im, t, to_screen, scale)` draws them on the camera-applied PIL image.
+`BIRDS = [(380, 0.17, 40, 0.0, 17), (560, 0.21, 34, 1.3, 14), (470, 0.13, 46, 2.1, 19)]`; flap = `sin(twos(t)*5.2)`
+modulated by a glide factor (slower periods where the bird glides).
+
+Tuple meaning (*measured* against the reference): `(x0_src, y_frac, speed_px_per_s, phase, half_span_px)`:
+source position `x = x0 + speed·t` (rightward), `y = y_frac·H` (+ a small bob); drawn at
+`to_screen(x, y)` with size `half_span·scale`. Check: at t=0 the gulls are on screen at ≈ (488,361), (669,287),
+(850,464) (= source (378,180), (468,143), (559,232)); at t=3.0 source ≈ (497,182), (607,131), (661,220) →
+speeds 40, 46, 34 px/s. Colour: dark slate (≈ (70,62,80), soft, alpha ~0.85), wings as two curved tapered strokes
+(gull "m" shape), wingspan on screen at t=0 ≈ 70 px. Flap: wing tips move ±(0.35·half_span) vertically with
+`sin(twos(t)*5.2 + phase)`, times a glide factor `g = 0.35 + 0.65·smoothstep(sin(t*0.7+phase))` (*inferred* — any
+slow modulation that makes them alternate flapping and gliding). Birds remain throughout s1–s2 (visible near the top
+of frame at 16.5 s).
+
+#### 4.4.3 The letter flight out (s2) and `fly()`
+
+`fly(lay, path, u, size0, size1, rot0, rot1, t, dot_col)` (*name and call recovered; body inferred*):
+- `path(u)` is a cubic Bézier in source px; the envelope sprite `ENV` (§4.8.3) is scaled to width
+  `size0 + (size1 − size0)·u` px, rotated `rot0 + (rot1 − rot0)·u` degrees, centred on `path(u)`.
+- A dotted trail of small round dots (radius ≈ 2.5–3 px, spacing ≈ 18–22 px along the arc) in `dot_col` is drawn along
+  the path from `u = 0` to the current `u` behind the envelope; the whole travelled trail stays visible. Dots taper
+  smaller toward the far end (the house).
+- Hidden when `u ≤ 0`; at `u = 1` the envelope is 16 px and sits at the window.
+
+`PATH_OUT` (*inferred* from the canvas storyboard, ×1.5): P0 (180, 960), P1 (540, 675), P2 (1080, 495),
+P3 = window (1501, 488) — from off the bottom-left, over the sea, arcing up and slightly over to the cottage window.
+Call: `fly(lay, PATH_OUT, u, 260, 16, -14, -2, t, (243, 235, 224, 170))` with
+`u = ease_io(min(1, (twos(t) − 14.46)/2.4))` (14.46 → 16.86). The envelope enters large (≈260 px), tilted −14°, at the
+bottom-left (frame at 15.0: lower-left corner), and shrinks into the window by 16.86.
+
+#### 4.4.4 Title fold-in — `title_reveal` (*recovered fragment, v8*, then **modified for the standalone title**)
+
+v8/v9 code (two tags: "EPISODE 4" dark + title light):
+
+```python
+TITLE_LAY = None
+def title_reveal(lt, dur):
+    """the episode title folds in: each tag grows from its left edge in stepped, ragged jumps (on twos), the lower line a beat
+    behind; on the way out it is wiped away left to right the same way"""
+    global TITLE_LAY
+    if TITLE_LAY is None:
+        TITLE_LAY = tag([("EPISODE 4", 16, (238, 238, 236), INK), ("THE UNCLE WHO ONLY READS LETTERS", 22, INK, (238, 238, 236))], (64 * F, H - 64 * F), "bl")
+    a = np.asarray(TITLE_LAY.getchannel("A"), np.float32)
+    ys, xs = np.nonzero(a > 0); x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+    lt = twos(lt); span = x1 - x0 + 24
+    split = H - 64 * F - (22 * F * 1.25 + 18 * F) - 5 * F                   # between the two tags
+    rows = np.arange(y0, y1)
+    r = np.random.default_rng(int(lt * 12) + 3)
+    band = np.repeat(r.uniform(-1, 1, (y1 - y0) // 5 + 2), 5)[: y1 - y0] * 5 * F   # ragged leading edge, re-cut every frame
+    delay = np.where(rows > split, 0.12, 0.0)
+    p_in = np.array([ease((lt - d) / 0.42) for d in delay]); p_out = np.array([ease((lt - (dur - 0.42) - d * 0.5) / 0.36) for d in delay])
+    edge_in = x0 - 12 + p_in * (span + 12) + band * (p_in < 1)
+    edge_out = x0 - 12 + p_out * (span + 12) + band * ((p_out > 0) & (p_out < 1))
+    cols = np.arange(x0, x1)[None, :]
+    m = ((cols < edge_in[:, None]) & (cols >= edge_out[:, None])).astype(np.float32)
+    out = np.array(TITLE_LAY); out[y0:y1, x0:x1, 3] = (out[y0:y1, x0:x1, 3] * m).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+```
+
+**Rebuild (owner change 2)**: one tag only, no delay:
+
+```python
+TITLE_LAY = tag([("THE UNCLE WHO ONLY READS LETTERS", 22, INK, (238, 238, 236))], (64 * F, H - 64 * F), "bl")
+delay = np.zeros(len(rows))          # no second line to lag
+```
+
+Everything else identical: fold-in 0.42 s from 5.60 (cubic ease-out, stepped at 12 fps, ragged leading edge re-cut
+each step with 5-row bands of ±5F px), held, wiped out left→right over 0.36 s starting at `dur − 0.42` (10.18 → 10.54).
+Geometry: the light tag box is x 96 → ≈ 96 + (text width + 42) px, y ≈ 915.75 → 984 (bottom-left anchored at
+(96, 984)); text IBM Plex Mono 33 px, INK on (238,238,236), tracking 0.10·33 px; box roughened (§4.8.1).
+In the reference (which still has EPISODE 4) the dark tag sits at y ≈ 850–901 above it — delete that.
+
+#### 4.4.5 `tag()` and `eyebrow()` (*recovered*, v9 values)
+
+```python
+EYEBROWS = False      # the black scene labels; off since v8 (the title tag stays)
+def eyebrow(*a, **k): return tag(*a, **k) if EYEBROWS else Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+TAGC = {}
+def tag(lines, pos, anchor="tl"):
+    """mono boxed tags; lines = [(text, size, fg, bg)]"""
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0)); dr = ImageDraw.Draw(lay)
+    x, y = pos; boxes = []
+    for text, size, fg, bg in lines:
+        fnt = font("mono", size * F); tr = size * F * (0.14 if size < 20 else 0.10)
+        tw = sum(dr.textlength(c, font=fnt) + tr for c in text) - tr
+        padx, pady = 12 * F if size < 20 else 14 * F, 7 * F if size < 20 else 9 * F
+        bw, bh = tw + 2 * padx, size * F * 1.25 + 2 * pady
+        boxes.append((text, fnt, tr, fg, bg, bw, bh, padx, pady))
+    if anchor == "bl":
+        y = y - sum(b[6] for b in boxes) - 10 * F * (len(boxes) - 1)
+    for text, fnt, tr, fg, bg, bw, bh, padx, pady in boxes:
+        bx = x if anchor in ("tl", "bl") else x - bw
+        key = (int(bw), int(bh), tuple(bg))
+        if key not in TAGC:
+            m = 8; bi = Image.new("RGBA", (int(bw) + 2 * m, int(bh) + 2 * m), (0, 0, 0, 0))
+            ImageDraw.Draw(bi).rectangle([m, m, m + bw, m + bh], fill=tuple(bg))
+            TAGC[key] = rough(bi, 0.6, 10, seed=31 + len(TAGC), fine=0.1)        # v8 softened (v7: 1.1, fine 0.22)
+        lay.alpha_composite(TAGC[key], (int(bx) - 8, int(y) - 8))
+        tracked(dr, (bx + padx, y + pady + 1), text, fnt, fg, tr)
+        y += bh + 10 * F
+    return lay
+
+def tracked(dr, xy, text, fnt, fill, track):
+    x, y = xy
+    for ch in text:
+        dr.text((x, y), ch, font=fnt, fill=fill)
+        x += dr.textlength(ch, font=fnt) + track
+    return x
+```
+
+With eyebrows off, **no** scene labels appear anywhere (the old ones were YOUR LETTER, HE READS EVERY WORD, HIS
+REPLY, AND THEN IT'S GONE, YOUR NEXT LETTER, EVERY LETTER CARRIES THE WHOLE CONVERSATION). The rebuild can drop
+`eyebrow` entirely.
+
+### 4.5 Transition w3: window-to-window blur (17.50 → 18.60)
+
+*Recovered names/params*: `light_rush(img_f, s, focus, blur, glow, radius, col)` using `zoom_at`; in the first 55 % of
+w3 the dusk shot rushes into `KD_win` (scale up to 3.6, blur up to 18 px, warm glow); then `resolve()` comes out of the
+uncle's head window `WIN_C` over `_RD`, which runs into the first 0.4 s of s3. In s3 the head window is open from the
+start (`window(lay, 1.0, …)`). Bodies not recovered — implement:
+
+- `zoom_at(img, s, focus)` — scale the image by `s` about the fixed point `focus` (focus stays put on screen; bicubic).
+- **Rush** (17.50 → 17.885, `q = (t − 17.50)/0.385`): take the frame `scene_dusk(t)` would give at this time (its push
+  box applies; the house window is at its screen position), then `s = 1 + 2.6·ease_in(q)` (→ 3.6; use `q²` or
+  `1 − ease_io` mirror), Gaussian blur σ = 18·q px, and add a warm radial glow at the window: colour `col` ≈
+  (255, 214, 140), radius growing from ≈ 60 px to > 1000 px, mixing amount → ≈ 0.85 at q=1 (frame 17.85 is a warm
+  yellow wash with the blurred hill still faintly visible bottom-left).
+- **Resolve** (17.885 → 18.60, `r = (t − 17.885)/0.715`): render `scene_reads(t − T["s3"][0])` (clamped ≥ 0) with the
+  window open, `zoom_at(img, s, WIN_C)` with `s = 1 + 1.2·(1 − ease(r))` (≈2.2 → 1.0), blur σ = 18·(1 − ease(r)),
+  warm glow at `WIN_C` fading from ≈0.85 to 0. *Measured* zoom about the hole: ≈1.67 at 18.00, ≈1.37 at 18.15,
+  ≈1.0–1.15 by 18.40; sharp by ≈18.40; settled at 18.60. Frame 18.00 shows the uncle blurred, greyed by the warm wash,
+  enlarged about the hole (hole stays at (537, 316)).
+- Sound: a whoosh panned 0.45 → −0.1 starting 0.35 s before w3 (§5.4).
+
+### 4.6 The uncle scenes (s3, s5; also the outgoing frame of w4 and the incoming frame of w6)
+
+#### 4.6.1 Layers and motion
+
+- `WIN_C = (0.27975 * W, 0.2924 * H)` = **(537.1, 315.8)**, `WIN_R = 62 * F` = **93 px** (*recovered*).
+- Composition per frame: `UBG` → body layer → head layer rotated by `θ` about `pivot` (bicubic, expand=False) →
+  collar layer → hole/window + icon (in head space, so they rotate with the head) → glint on the glasses lens →
+  overlays (letter card, drifting words).
+- Breathing loop (*recovered: "a breathing loop"*; measured): the whole figure (or head + shoulders) rises and falls
+  ≈ ±3 px with a period of ≈ 4–5 s (head top measured 165–173 px during s3/s5).
+- Read-nod (s3, `READ_TILT = 1.6` → 19.80): head rotates forward (nose down) by ≈ 1.5–2° about `pivot`, eased over
+  ≈ 0.7 s, held to the end of s3 (measured: nose tip (775,438) → (781–783, 446–449); back of skull x 406 → 412).
+- s5 starts in the nodded pose and lifts back upright around FORGET (back of skull 417 at 30.0 s → 403 by 34.0 s, *measured*)
+  — i.e. ease the tilt from 1 → 0 over ≈1 s starting at FORGET (32.79).
+- Dry glint (*recovered*): a thin short diagonal highlight line across the glasses lens, alpha `150·g`, Gaussian blur
+  0.8, where `g` is a brief pulse (*inferred*: one pulse when the letter lands in s3 and occasionally after; keep it
+  subtle — owner: "the blink should feel less glowy"; the halo around the hole was removed in v6/v7).
+
+#### 4.6.2 The hole — `window()` (*recovered: "the crisp supersampled hole (`window()`), with the icon threshold at > 0.02"*)
+
+`window(lay, open_frac, icon=0.0, …)` draws, at 4× supersampling then LANCZOS down, a filled circle of radius
+`WIN_R·open_frac` at `WIN_C` in the uncle-background colour (≈ (228, 217, 201) — sample `UBG` at the centre so it
+reads as a hole through the head), crisp edge, no halo. If `icon > 0.02` it draws the envelope sprite `ENV` inside,
+centred, at width `≈ 1.1·WIN_R·icon` (full icon ≈ 100 px wide, measured), with a faint drop shadow. (The `> 0.02`
+threshold avoids a zero-size resize crash.)
+
+- s3: `open_frac = 1` from the first frame of s3 (also during the resolve). Icon: 0 until s3 + 0.70 (18.90), then grows
+  `icon = ease((lt − 0.70)/0.30)` (tiny at 18.95, full by ≈19.20); stays 1.
+- s5: icon 1 until FORGET (32.79), then shrinks `icon = 1 − ease((lt − FORGET)/0.35)` (gone ≈33.15). Hole stays open
+  until `HOLE_CLOSE = 9.3` (39.49), then `open_frac = 1 − ease_io((lt − 9.3)/0.45)` (measured ≈0.85 at 39.65, ≈0.55 at
+  39.8, closed by ≈40.0) and the head is solid for the rest of s5 and in w6.
+
+#### 4.6.3 Scene 3 — `scene_reads(lt)` (18.20 → 24.10)
+
+- Uncle layers, window open, envelope icon arriving at 0.70 s (with the `settle` sound at s3+0.75).
+- The letter card `LETTER = card([("i", "Dear Uncle,"), ("r", "What can I cook tonight with eggs and spinach?"), ("i", "Love, Sam")], 420 * F, -2)`
+  (*recovered*; default `size=30` → 45 px Source Serif; italic lines in `serif_i`) slides in from the right at
+  s3 + 1.2 (19.40; `slide_b` sound): from off-screen right to its rest position in ≈0.5 s with `ease`, on twos.
+  Rest position (*measured*): paper rect ≈ x 1134–1775, y 271–806 (rotated −2°, i.e. clockwise, right side lower);
+  first text line ("Dear Uncle,") cap top at y ≈ 353, x ≈ 1203. At 19.6 it is still entering (left edge ≈ x 1545).
+- Read-nod at 1.6 s, breathing throughout. Card stays until the w4 wipe.
+
+#### 4.6.4 Scene 5 — `scene_forget(lt)` (30.19 → 40.90)
+
+- Uncle layers; envelope icon in the hole at the start; head lifts upright after FORGET.
+- At FORGET (32.79) the icon shrinks away (`air` sound, §5.4) and the **words drift out** of his face:
+  `WORDS = [("spinach", 26, 0, 90, .85), ("eggs", 24, 60, 160, .75), ("tonight", 22, 150, 40, .6), ("omelette", 22, 200, 220, .55), …]`
+  (*recovered* first four; the full storyboard list from the canvas is
+  `("Dear Uncle", 20, 290, 120, .45), ("butter", 18, 380, 290, .35), ("Sam", 16, 470, 60, .25), ("fold", 15, 520, 190, .2), ("cook", 13, 610, 260, .12), ("love", 12, 660, 140, .08)`
+  — all ten are visible in the reference). Tuple = `(text, size_1280, x_1280, y_1280, alpha)`; the storyboard placed
+  them relative to an origin (440, 110) in 1280-space → (660, 165) px; font `mono` at `size·F` px; colour INK at `alpha`.
+- Motion (*measured*, behaviour to reproduce): words appear one after another from FORGET + 0.1 s (spinach first,
+  then eggs, tonight, …, ≈0.12–0.2 s apart), each emerging at the front of the face (≈ (810, 350)) and easing out over
+  ≈1–1.5 s to its layout spot `(660 + x·F, 165 + y·F)`, then drifting slowly right (≈ +10 px/s for the near words up to
+  ≈ +45 px/s for the far ones) and slightly up, so the cloud of words spreads. Positions measured (top-left of text):
+  spinach (815,343) @32.9 → (782,303) @34.2 → (799,293) @36.0 → (813,270) @37.0 → (838,272) @38.6; eggs (≈850,385) @34–37;
+  tonight (1028,195) @37.0; Dear Uncle (1146,343) @36.0 → (1230,345) @37.0; Sam (1368,269) @36 → (1484,248) @37;
+  omelette (1080,490) @36.0; butter (1299,574) @36; fold (1352,420) @36; cook (1320,464) @36; love (1635,365) @37.
+  Opacity: fade in over ≈0.4 s each; all fade out together over `FADE_WORDS = (7.2, 9.5)` → 37.39 → 39.69 (gone by
+  "Gone" at 39.61). Drawn on twos.
+- Hole closes from 39.49 (above). The last second (40.0–40.9) is the uncle with a solid head.
+
+### 4.7 Paper scenes with the prompt box (s4 yellow, s6 pink)
+
+#### 4.7.1 Helpers (*recovered*, v9 values)
+
+```python
+def wrap(dr, text, fnt, width):
+    words, lines, cur = text.split(" "), [], ""
+    for w_ in words:
+        trial = (cur + " " + w_).strip()
+        if dr.textlength(trial, font=fnt) <= width: cur = trial
+        else: lines.append(cur); cur = w_
+    lines.append(cur); return lines
+
+def text_block(lay, xy, text, fnt, width, lh, fill=INK, nchars=None, cursor=False):
+    dr = ImageDraw.Draw(lay)
+    lines = wrap(dr, text, fnt, width)
+    shown = len(text) if nchars is None else nchars
+    x, y = xy; used = 0
+    last = (x, y)
+    for ln in lines:
+        take = max(0, min(len(ln), shown - used))
+        dr.text((x, y), ln[:take], font=fnt, fill=fill)
+        last = (x + dr.textlength(ln[:take], font=fnt), y)
+        used += len(ln) + 1
+        if take < len(ln): break
+        y += lh
+    if cursor:
+        cx, cy = last
+        dr.rectangle([cx + 6 * F, cy + 0.12 * lh, cx + 9 * F, cy + 0.88 * lh], fill=fill)
+    return lines
+
+PBC = {}
+def prompt_box(lay, xy, w, text, size, highlight=None, nchars=None):
+    dr = ImageDraw.Draw(lay); fnt = font("sans", size * F)
+    lines = wrap(dr, text, fnt, w - 64 * F)
+    lh = size * F * 1.4
+    hgt = len(lines) * lh + 52 * F
+    x, y = xy
+    # --- (rest not recovered) ---
+```
+
+Rest of `prompt_box` (*inferred*, consistent with the frames): the outline is a rounded rectangle at
+`(x, y, x + w, y + hgt)`, radius 18F, stroke ≈ 2F (3 px) INK, drawn into a cached RGBA image (`PBC`, keyed by size) and
+roughened with `rough(bi, 0.55, 14, seed=61 + len(PBC), fine=0.05)` (v8; v7 was 0.9/0.1) — the outline reads hand-drawn
+and slightly wavy. Text in `sans` at `size·F`, INK, starting at `(x + 32F, y + 26F)`, line height `1.4·size·F`, wrapped
+at `w − 64F`, showing `nchars` characters (typing; no cursor in the box). `highlight = (word, p)`: before drawing the text,
+fill a rectangle behind the regex-matched word (`\bword\b`) in `HL` from the word's left edge to `left + p·width`
+(full height of the line box ≈ x-height + ascenders, padding ≈ 2–4 px), so the sweep runs left→right. The box height
+is computed from the **full** text so it doesn't grow while typing. Returns the box rect (the recovered call stores
+it: `hb = prompt_box(...)`).
+
+#### 4.7.2 Scene 4 — `scene_reply(lt)` on `YEL` (24.70 → 29.49)
+
+- `hb = prompt_box(lay, (240 * F, 150 * F), 800 * F, "Dear Uncle, what can I cook tonight with eggs and spinach? Love, Sam", 28)`
+  (*recovered*) → box x 360–1560, y 225–≈421 (2 lines of Manrope 42 px; *measured* outline bbox (359,223)–(1562,424);
+  text starts (411, 279)).
+- Reply (*inferred from frames + canvas*): `text_block(lay, (244F, hb_bottom + 40F), REPLY, font("serif_b", 34F), 800F, 34F*1.35, nchars=m, cursor=True)`
+  with `REPLY = "A spinach omelette. Wilt the spinach in butter, pour in three beaten eggs, fold it over and serve."`
+  (98 chars) and `m = int((twos(lt) − 0.6)·24)`. Measured: first line cap top y = 497, x = 367; line height ≈ 69 px;
+  wraps after "butter," (line 1 ends x ≈ 1511). Before typing starts (lt < 0.6) a bold "…" sits at the text origin
+  (visible at 25.0). The cursor (a 3F-wide bar) shows while typing and remains after the last character.
+- Sound: typewriter keystrokes, one per character (§5.5).
+
+#### 4.7.3 Scene 6 — `scene_second(lt, static=False)` on `PINK` (41.50 → 49.37)
+
+- Prompt box at `(240 * F, 190 * F)`, width `800 * F`, size **30** (45 px): measured outline (360, 283)–(1561, 429).
+  Text "Thanks! Can you make it without eggs?" types into it from `Q2_TYPE = (1.5, 16.0)` → 43.00 at 16 cps
+  (`nchars = int((twos(lt) − 1.5)·16)`; empty box before 43.0).
+- At `ANS_DOTS = 3.9` (45.40) a bold "…" appears at the answer origin; from `ANS_TYPE = (4.3, 14.0)` (45.80) "Make what,
+  dear?" types at 14 cps in `serif_b` **40F (60 px)**, at `(244F, box_bottom + 44F)` ≈ (366, 495); measured cap top
+  y = 515, x = 368, extent to x ≈ 872.
+- At `IT_SWEEP = 6.0` (47.50) the word "it" in the prompt box gets a yellow sweep (`highlight=("it", ease((lt − 6.0)/0.4))`;
+  partial at 47.6, full by ≈47.9). Sound: `slide_b` swipe at −30 dB.
+- `static=True` (used as the outgoing frame of w7) = everything complete.
+
+### 4.8 Cards, tape, envelope, edge roughness
+
+#### 4.8.1 `rough()` — static edge roughness (*recovered*)
+
+```python
+HL = (245, 212, 74)                      # the one accent: Vox-ish marker yellow
+def rough(im, amp=1.5, size=12, seed=0, fine=0.3):
+    """static turbulent displacement on an RGBA image, so flat shapes read as cut or printed rather than vector-perfect"""
+    a = np.asarray(im, np.float32); h, w = a.shape[:2]
+    r = np.random.default_rng(seed)
+    def field():
+        f = ndi.gaussian_filter(r.standard_normal((h, w)).astype(np.float32), size / 3)
+        g = ndi.gaussian_filter(r.standard_normal((h, w)).astype(np.float32), 1.0)
+        return f / (f.std() + 1e-6) * amp + g / (g.std() + 1e-6) * amp * fine
+    dx, dy = field(), field()
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = np.stack([ndi.map_coordinates(a[..., c], [yy + dy, xx + dx], order=1, mode="nearest") for c in range(4)], -1)
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGBA")
+```
+
+v9 settings (the owner said v7's were "slightly too rough"; v8 roughly halved them):
+
+| element | v9 call | (v7) |
+|---|---|---|
+| tag boxes | `rough(bi, 0.6, 10, seed=31 + len(TAGC), fine=0.1)` | (1.1, 10, fine 0.22) |
+| prompt-box outline | `rough(bi, 0.55, 14, seed=61 + len(PBC), fine=0.05)` | (0.9, 14, fine 0.1) |
+| envelope | `ENV = rough(envelope(320), 0.6, 10, seed=7, fine=0.15)` | (1.0, 10) |
+| card paper | `im = rough(im, 0.8, 12, seed=101 + seed, fine=0.15)` | (1.4, 12) |
+
+Roughness is static (no boil). Text is always drawn **after** roughening so it stays crisp.
+
+#### 4.8.2 `card()` (*signature, docstring fragment and anchor code recovered; layout inferred*)
+
+`card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0, anchors=None)`:
+"lays out first, draws marker sweeps `{word: progress}` via regex `\b…\b`, roughens, draws text, rotates, and
+optionally returns word anchors (left, right, top, bottom) mapped through the rotation"; docstring: "anchors: list of
+words whose (left, right, mid-y) positions in the rotated image are returned as well."
+
+- `text_lines`: list of `(style, text)` with style `"i"` (serif_i), `"r"` (serif, or serif_b if `bold`), (or plain
+  strings when `bold=True`, as `C2_ARGS` passes). Font size `size·F` px; line height ≈ 1.4–1.45 × size·F; paragraph
+  gap ≈ 0.5–0.65 × size·F; padding ≈ 26F top/bottom, 30F sides for the small history cards (canvas), 40F/44F for the
+  big letter (measured text inset ≈ 68 px).
+- `label`: small caps line above the text in `mono` ≈ 13F (≈ 20 px), tracking 0.14 em, colour (109,106,111), gap 10F.
+- Paper (242,233,217) rectangle `w` wide × content height, on a transparent canvas with a margin (≈ 40 px each side,
+  hence `CARD_POS = (x·F − 40, y·F − 40)`), soft drop shadow (offset ≈ (0, 14F·0.7), blur ≈ 20–30 px, INK at α ≈ 0.16).
+- `marks`: highlights drawn on the paper before roughening: for each `{phrase: p}` find the phrase (word-boundary
+  regex) in the laid-out lines and fill `HL` from its left to `left + p·width`, height ≈ 0.95·size·F, with a slightly
+  irregular marker edge (it then gets roughened with the paper).
+- Then `rough(im, 0.8, 12, seed=101+seed, fine=0.15)`, then the text (crisp), then `im.rotate(rot, expand=True, resample=BICUBIC)`
+  (PIL: positive = counter-clockwise).
+- Anchors (*recovered*):
+
+```python
+    if anchors is None: return out
+    W1, H1 = out.size; ar = math.radians(rot)
+    def rp(px, py):
+        dx, dy = px - W0 / 2, py - H0 / 2
+        return (W1 / 2 + dx * math.cos(ar) + dy * math.sin(ar), H1 / 2 - dx * math.sin(ar) + dy * math.cos(ar))
+    res = {}
+    for word in anchors:
+        f_ = find(word)
+        if f_:
+            x0, x1, yy_ = f_; ym = yy_ + 0.62 * fs
+            res[word] = dict(left=rp(x0, ym), right=rp(x1, ym), top=rp((x0 + x1) / 2, yy_ + 0.05 * fs), bottom=rp((x0 + x1) / 2, yy_ + 1.25 * fs))
+    return out, res
+```
+
+  (`W0, H0` = unrotated size; `fs` = font px; `find(word)` returns `(x0, x1, line_top_y)` of the first `\bword\b` match.)
+
+#### 4.8.3 `tape()` and `envelope()`
+
+- `tape(w, h, rot, seed)` — "a strip of paper tape: translucent, torn ends" (*recovered docstring*): a `w×h` px strip
+  (120×36 here, **not** ×F) of (236,224,196) at α ≈ 0.78 with ragged short ends (seeded), faint fibre texture,
+  rotated `rot` degrees.
+- `envelope(w)` — `w = 320` px wide sprite, aspect ≈ 1.55 (≈ 320×206): paper (239,230,214) with a thin border
+  (205,191,168), flap V lines (168,151,127) from the top corners to ≈ 60 % height at the centre, two lower fold lines
+  from the bottom corners toward the centre (205,191,168), a red stamp (188,97,94, α 0.85) top-right (≈ 13 %×25 % of
+  the size, inset ≈ 7 %), and a soft shadow. `ENV = rough(envelope(320), 0.6, 10, seed=7, fine=0.15)`.
+
+#### 4.8.4 Scene 7 — `scene_history(t, static=False)` on `CREAM` (49.97 → 61.17)
+
+*Recovered* (v9 final; arrow waypoints from the last patch):
+
+```python
+CARDS = [card([("r", "What can I cook tonight with eggs and spinach?")], 500 * F, 3, "YOUR FIRST LETTER", size=22, seed=1),
+         card(*C2_ARGS, size=22, seed=2),
+         card(*C3_ARGS, size=22, seed=3)]
+_, ANC2 = card(*C2_ARGS, size=22, seed=2, anchors=["omelette", "spinach"])
+_, ANC3 = card(*C3_ARGS, size=22, seed=3, anchors=["it"])
+CARD_HL = {}
+def card_marked(i, p_it, p_om):
+    key = (i, round(p_it, 2), round(p_om, 2))
+    if key not in CARD_HL:
+        CARD_HL[key] = card(*C2_ARGS, size=22, seed=2, marks={"spinach omelette": p_om}) if i == 1 else card(*C3_ARGS, size=22, seed=3, marks={"it": p_it})
+    return CARD_HL[key]
+
+CARD_POS = [(110 * F - 40, 140 * F - 40), (150 * F - 40, 300 * F - 40), (125 * F - 40, 470 * F - 40)]
+TAPES = [(tape(120, 36, 6, 1), (110 * F + 300, 140 * F - 26)), (tape(120, 36, -8, 2), (150 * F + 360, 300 * F - 26)), (tape(120, 36, 4, 3), (125 * F + 320, 470 * F - 26))]
+ANS2 = "Without eggs? Try spinach and cheese on toast."
+def scene_history(t, static=False):
+    lt = twos(t)
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    p_it = 1 if static else ease((lt - ANNOT[0]) / 0.45)
+    p_ar = 1 if static else (lt - ANNOT[1]) / 0.65
+    p_om = 1 if static else ease((lt - ANNOT[2]) / 0.5)
+    for i, (c, pos) in enumerate(zip(CARDS, CARD_POS)):
+        if i == 1 and p_om > 0: c = card_marked(1, 0, p_om)
+        if i == 2 and p_it > 0: c = card_marked(2, p_it, 0)
+        p = 1 if static else ease((lt - CARD0 - CARD_GAP * i) / 0.45)
+        if p <= 0: continue
+        cc = c if p >= 1 else c.resize((int(c.width * (1.08 - 0.08 * p)), int(c.height * (1.08 - 0.08 * p))), Image.LANCZOS)
+        x = pos[0] - (cc.width - c.width) / 2; y = pos[1] - (cc.height - c.height) / 2 - 60 * (1 - p)
+        a = Image.new("RGBA", (W, H), (0, 0, 0, 0)); a.alpha_composite(cc, (int(x), int(y)))
+        if p < 1: a.putalpha(a.getchannel("A").point(lambda v: int(v * min(1, p * 2))))
+        lay.alpha_composite(a)
+        tp, tpos = TAPES[i]
+        if static or lt > CARD0 + CARD_GAP * i + 0.5: lay.alpha_composite(tp, (int(tpos[0]), int(tpos[1])))
+    if p_ar > 0:      # from "it" in the new letter, round to the end of "spinach omelette" in his reply
+        it = ANC3["it"]["top"]; om = ANC2["omelette"]["right"]
+        a0 = (CARD_POS[2][0] + it[0], CARD_POS[2][1] + it[1] - 10)      # rises straight out of the middle of "it"
+        a3 = (CARD_POS[1][0] + om[0] + 16, CARD_POS[1][1] + om[1])
+        R = CARD_POS[1][0] + CARDS[1].width - 20
+        # up out of the middle of "it", right through the clear band under his reply, round the card's edge and back in
+        ym = (a0[1] - 100 + a3[1]) / 2
+        ink_arrow(lay, (a0, (a0[0] + 10, a0[1] - 40), (a0[0] + 100, a0[1] - 68), (R - 30, a0[1] - 76), (R + 30, a0[1] - 90), (R + 62, a0[1] - 116),
+                        (R + 74, ym), (R + 60, a3[1] + 24), (R + 22, a3[1] + 9), (a3[0] + 90, a3[1] + 3), a3), ease_io(p_ar))
+    if static or lt > ANS2_DOTS:
+        m = len(ANS2) if static else int((lt - ANS2_TYPE[0]) * ANS2_TYPE[1])
+        if not static and lt < ANS2_TYPE[0]: text_block(lay, (760 * F, 300 * F), "…", font("serif_b", 34 * F), 420 * F, 34 * F * 1.35)
+        elif m > 0: text_block(lay, (760 * F, 300 * F), ANS2, font("serif_b", 34 * F), 420 * F, 34 * F * 1.35, nchars=m)
+    # (the eyebrow "EVERY LETTER CARRIES THE WHOLE CONVERSATION" was here; EYEBROWS = False → nothing)
+    return np.asarray(comp(CREAM, lay).convert("RGB"), np.float32) / 255
+```
+
+`C2_ARGS` / `C3_ARGS` (*summary + frames; exact tuples not recovered*):
+- `C2_ARGS = (["A spinach omelette.", "Wilt the spinach in butter, pour in three beaten eggs…"], 500 * F, ≈ -1.5, "HIS REPLY", True)`
+  — two paragraphs, **bold** serif 33 px, label HIS REPLY (measured card 2 top edge falls to the right ≈1–1.5°).
+  The reply text is deliberately cut with "…" (the tape of card 3 covers "eggs…").
+- `C3_ARGS = ([("r", "Thanks! Can you make it without eggs?")], 500 * F, ≈ 1, "YOUR NEW LETTER")`.
+- (canvas storyboard rotations were −3 / +1.5 / −1; the video uses +3 / ≈−1.5 / ≈+1 — match the reference.)
+
+Measured rest positions (paper corners, full res): card 1 ≈ x 171–930, y 211–502 (rot +3°, counter-clockwise);
+card 2 ≈ x 231–984, y 454–795; card 3 ≈ x 191–944, y 705–922; tapes centred near the top edge of each card at
+x ≈ 465–585 (tape 1 at (465, 184), tape 2 at (585, 424), tape 3 at (507, 679) top-left).
+
+Drop-in: each card scales from 1.08 → 1.0 and falls 60 px → 0 with `ease` over 0.45 s, opacity `min(1, 2p)`, starting
+52.67 / 53.87 / 55.07; tape appears 0.5 s after each start (with `slide_a` + `settle` + `tape` sounds).
+
+Annotation (`ANNOT = (7.1, 7.6, 8.3)`): "it" on card 3 swept yellow 57.07→57.52; the ink arrow draws on 57.57→58.22
+(`ease_io`), head appears at the end; "spinach omelette" on card 2 swept 58.27→58.77. In the reference (frame 1464,
+t = 61.0) the arrow rises from just above the middle of "it" ("it" sits at ≈ (627, 825)), curves up-right into the clear
+band between card 2's last text line ("three beaten eggs…", y ≈ 690) and card 3's top edge, runs right at y ≈ 715,
+loops round outside card 2's right edge (outermost x ≈ 1065), climbs to the "A spinach omelette." line (y ≈ 578) and
+comes back left, arrowhead pointing left, ending ≈ 16 px right of "omelette." (≈ (630, 578)).
+
+ANS2: "…" at 58.87; types 59.17 → 61.09 at 24 cps; bold serif 51 px at (1140, 450), width 630 px, line height 68.85 px →
+three lines "Without eggs? Try / spinach and cheese on / toast." (measured line tops 466 / 535 / 609, x = 1141).
+
+#### 4.8.5 `ink_arrow` (*recovered, final v9 form assembled from the patches*)
+
+```python
+def bez(p0, p1, p2, p3, u):          # cubic Bézier point (ep4_video's own helper; NOT the engine's quadratic bez)
+    a = 1 - u
+    return (a**3 * p0[0] + 3*a*a*u * p1[0] + 3*a*u*u * p2[0] + u**3 * p3[0],
+            a**3 * p0[1] + 3*a*a*u * p1[1] + 3*a*u*u * p2[1] + u**3 * p3[1])
+
+def ink_arrow(lay, pts, prog, seed=5, width=3.6):
+    """a hand-drawn ink arrow along a curve, drawn on progressively; head appears when the line arrives"""
+    if prog <= 0: return
+    r = np.random.default_rng(seed); n = 90
+    us = np.linspace(0, 1, n)
+    if len(pts) == 4: P = np.array([bez(*pts, u) for u in us])
+    else:             # a smooth Catmull-Rom curve through the waypoints, resampled evenly along its length
+        Q = np.array(pts, np.float64); Q = np.vstack([2 * Q[0] - Q[1], Q, 2 * Q[-1] - Q[-2]]); fine_ = []
+        for i in range(1, len(Q) - 2):
+            p0, p1_, p2, p3 = Q[i - 1], Q[i], Q[i + 1], Q[i + 2]
+            for u in np.linspace(0, 1, 40, endpoint=False):
+                fine_.append(0.5 * (2 * p1_ + (-p0 + p2) * u + (2 * p0 - 5 * p1_ + 4 * p2 - p3) * u * u + (-p0 + 3 * p1_ - 3 * p2 + p3) * u ** 3))
+        fine_.append(Q[-2]); fine_ = np.array(fine_)
+        L = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(fine_, axis=0), axis=1))])
+        P = np.stack([np.interp(us * L[-1], L, fine_[:, c]) for c in range(2)], 1)
+        ends = P[[0, -1]].copy(); P = ndi.gaussian_filter1d(P, 3.0, axis=0, mode="nearest")    # round the corners like a hand would
+        w_ = np.clip(np.minimum(np.arange(n), n - 1 - np.arange(n)) / 6, 0, 1)[:, None]
+        P[:n // 2] = P[:n // 2] * w_[:n // 2] + ends[0] * (1 - w_[:n // 2]); P[n // 2:] = P[n // 2:] * w_[n // 2:] + ends[1] * (1 - w_[n // 2:])
+    d = np.gradient(P, axis=0); nrm = np.stack([-d[:, 1], d[:, 0]], 1); nrm /= np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-6
+    P = P + nrm * (ndi.gaussian_filter(r.standard_normal(n), 4) * 1.6)[:, None]       # a slightly wavering hand
+    m = max(2, int(n * min(1, prog)))
+    x0, y0 = P.min(0) - 40; x1, y1 = P.max(0) + 40; k = 3
+    im = Image.new("RGBA", (int((x1 - x0) * k), int((y1 - y0) * k)), (0, 0, 0, 0)); dr = ImageDraw.Draw(im)
+    Q = [((x - x0) * k, (y - y0) * k) for x, y in P[:m]]
+    for j in range(len(Q) - 1):
+        wj = width * k * (0.75 + 0.35 * math.sin(j / n * math.pi))
+        dr.line([Q[j], Q[j + 1]], fill=INK + (235,), width=int(wj))
+        dr.ellipse([Q[j + 1][0] - wj / 2, Q[j + 1][1] - wj / 2, Q[j + 1][0] + wj / 2, Q[j + 1][1] + wj / 2], fill=INK + (235,))
+    if prog >= 1:
+        tip = np.array(Q[-1]); back = np.array(Q[-6]); v = (tip - back) / (np.linalg.norm(tip - back) + 1e-6)
+        for ang in (0.5, -0.5):
+            c_, s_ = math.cos(ang), math.sin(ang); wv = np.array([v[0] * c_ - v[1] * s_, v[0] * s_ + v[1] * c_])
+            dr.line([tuple(tip), tuple(tip - wv * 17 * F * k)], fill=INK + (235,), width=int(width * k))
+    lay.alpha_composite(im.resize((int(x1 - x0), int(y1 - y0)), Image.LANCZOS), (int(x0), int(y0)))
+```
+
+(The cubic `bez(p0,p1,p2,p3,u)` body is *inferred*; it is the standard cubic. `INK` is an RGB tuple.)
+
+### 4.9 Paper-sheet transitions w4–w7 — `sheet()`
+
+*Recovered calls*:
+```python
+elif in_("w4", t): img = sheet(scene_reads(local("s3", t)), scene_reply(0), frac("w4", t), "left", 12)
+elif in_("w7", t): img = sheet(scene_second(0, static=True), scene_history(0), frac("w7", t), "left", 15)
+```
+w5 and w6 calls were not shown; *inferred*: `sheet(scene_reply(<end>), scene_forget(0), frac("w5", t), "down", 13)` and
+`sheet(scene_forget(<end>), scene_second(0), frac("w6", t), "up", 14)`.
+
+Behaviour (*measured*): a sheet boundary with a **torn paper edge** sweeps across the frame; position = `ease(p)`
+(cubic ease-out — 70 % covered at p = 0.33, 43 % at p = 0.17).
+- **w4 "left"** (24.10–24.70): the yellow s4 frame is revealed from the right; the torn edge (a vertical ragged line)
+  moves from x = W to x = 0: `edge_x = W·(1 − ease(p))`. Both images static (the incoming yellow content is already
+  in its final place — the prompt box's right end is at its final x while the edge is at x ≈ 600).
+- **w5 "down"** (29.49–30.19): the **outgoing yellow sheet slides down** off the frame (its content translates down
+  with it), revealing the uncle (static) underneath: yellow top edge `y = H·ease(p)`, yellow content offset `+H·ease(p)`.
+  The yellow sheet casts a dark soft shadow upward onto the uncle (dark ragged fringe above its torn top edge).
+- **w6 "up"** (40.90–41.50): pink revealed from the bottom; torn horizontal edge rising `y = H·(1 − ease(p))`; contents
+  static. A light-grey soft shadow band (≈20–30 px) falls on the uncle just above the pink edge.
+- **w7 "left"** (49.37–49.97): cream revealed from the right as w4.
+- Torn edge: a ragged line (amplitude ≈ ±4–6 px, fine fibrous jaggies at ≈3–8 px wavelength plus a slow wobble),
+  seeded by the last argument (12–15), with a thin brighter paper lip (a 2–4 px lighter fringe, fibres) on the incoming
+  sheet's edge and a soft shadow (σ ≈ 8–12 px, α ≈ 0.25) cast by the top sheet onto the one beneath.
+- Sound per wipe: a paper slide starting 0.05 s before the wipe and a "settle" thud at its end (§5.4).
+
+### 4.10 f8 dip to night, s8 night, end fade, and the frame dispatcher
+
+*Recovered*:
+```python
+    elif in_("f8", t):
+        p = frac("f8", t)
+        img = scene_history(0, static=True) * (1 - ease_io(p / 0.45)) if p < 0.45 else (scene_night(T["s8"][0]) * ease_io((p - 0.55) / 0.45) if p > 0.55 else np.zeros((H, W, 3), np.float32))
+    else: img = scene_night(t)
+
+def scene_night(t):
+    lt = t - T["s8"][0]
+    base = living_sea(NIGHT, KN, lt, night=True)
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    u = ease_io(min(1, max(0, (twos(lt) - FLY_HOME[0]) / FLY_HOME[1])))
+    if u > 0: fly(lay, PATH_HOME, u, 16, 300, 0, 8, t, (246, 207, 134, 150))
+    im = push(comp(base, lay), lt, END - T["s8"][0], KN_win, 0.04)
+    return np.asarray(im.convert("RGB"), np.float32) / 255
+```
+
+- f8: s7's final state fades to black 61.17 → 61.71 (`ease_io`), black 61.71 → 61.83, night fades up 61.83 → 62.37
+  (measured mean luma 211 → 0 → 61).
+- s8: night sea with clouds drifting (on the s8 clock), glints, flicker (`night=True` → +0.04 base flicker, full glow);
+  the reply envelope leaves the window at 63.17 tiny (16 px) and flies toward the viewer, growing to 300 px and
+  rotating 0 → +8° (PIL CCW) by 67.37 along `PATH_HOME`, leaving a gold dotted trail; whole frame pushes 4 % toward the
+  window over the scene. `PATH_HOME` (*inferred* from the storyboard ×1.5): window (1501, 488) → (1230, 540) →
+  (840, 660) → (510, 840) (ends lower-left of centre over the sea; measured envelope centre ≈ (527, 872) on screen at 70 s,
+  with a red stamp at its top-right).
+- **End fade (picture)**: *measured* — the picture fades to black from ≈70.90 to ≈71.95 (mean luma 65.8 → 0, roughly
+  linear). Not in the recovered code; implement `img *= clip((END − 0.10 − t)/1.05, 0, 1)` (or ease) so it reaches
+  black at ≈71.95 and matches the audio fade (§5.8).
+- Dispatcher order (*inferred*, consistent with recovered branches): s1/s2 → `scene_dusk(t)`; w3 → rush/resolve;
+  s3 → `scene_reads(local("s3", t))`; w4 → sheet; s4 → `scene_reply(local("s4", t))`; w5; s5 → `scene_forget(...)`;
+  w6; s6 → `scene_second(...)`; w7; s7 → `scene_history(local("s7", t))`; f8; else `scene_night(t)`.
+  (Note `scene_history` takes the **local** time; `scene_night` takes absolute `t`.)
+
+---
+
+## 5. Audio — `ep4_audio2.py`
+
+48 kHz stereo float32 buses: `mix` (effects), `amb` (ambience, ducked separately), `music`, `VO` (mono voice).
+`N = int(END * SR)` = 3,458,400 samples. All placement times are **video** time.
+
+### 5.1 Sounds (Freesound, CC0, HQ preview mp3s)
+
+| key | Freesound ID | title / author (credits.md) | used for |
+|---|---|---|---|
+| `sea` | 578524 | Calm ocean waves — SamsterBirdies | dusk and night sea beds |
+| `gulls` | 537854 | Seagulls distant.wav — Ambientsoundapp | before the first word, and in gap 1 |
+| `room` | 641306 | House Room Tone — aleclubin | the uncle's room, w3 end → f8 |
+| `clock` | 434841 | Kitchen Wall Clock Ticking 2 — giddster | under s3 and s5 |
+| `slide_a` | 464302 (cat `paper_slide`) | PaperSlide.wav — eyesonlegs | wipes w4/w6, cards, pen arrow |
+| `slide_b` | 154403 (cat `paper_slide`) | paper slide.wav — semccab | wipes w5/w7, letter slide-in, highlighter swipes |
+| `settle` | 406586 (cat `paper_settle`) | Picture Drop_Heavy Paper_Near_Mono — _stubb | end of wipes, envelope lands, cards land |
+| `flutter` | 468113 | Flutter.wav — Aquafeniz | envelope launch / arrival |
+| `whoosh` | 701104 | Whoosh stereo light (transition) — xkeril | w3 rush, envelope flights |
+| `tape` | 467721 | Free Tape Ripping Sound — MilkyGacha | cards taped down |
+| `air` | 182868 | Sandy Breeze (foley) — FableVision_Studios | words leave his head |
+| `typewriter` | 406241 | (not in the attached credits.md; look up on the page) | per-character keystrokes |
+| (`shaker` 375639, `kalimba` 331047, `bass` 383711, `kick` 371192, `snap` 332604 as `snap2_332604`, `rim` 82280) | | | **not used** in the track version (they belonged to the piano/kalimba "bed" modes) |
+
+Fetching (*recovered approach*, `sfx_fetch.py`): only `freesound.org` and `cdn.freesound.org` were reachable. Search /
+sound pages are HTML; each player is an element with `class="bw-player"` carrying `data-sound-id`, `data-username`,
+`data-mp3`, `data-title`, `data-duration`, `data-num-downloads`; the `data-mp3` URL ends `-lq.mp3`; replace with
+`-hq.mp3` and download (`curl -s -m 60`). Files were stored as `sfx/raw/<cat>_<id>.mp3` and decoded with
+`ffmpeg -v error -i FILE -f f32le -ac 2 -ar 48000 -`. The rebuild kit stores them as `assets/sfx/raw/<id>.mp3` with
+`assets/sfx/manifest.json` (map the keys above to ids). `credits.md` is regenerated from the manifest for the ids in
+`USE` (header "All from Freesound under CC0 (public domain). Voice: ElevenLabs (Sekou)." — the attached old copy
+still says MiniMax and lacks the typewriter line; music: add a line for the reference track, licence unknown).
+
+### 5.2 Core helpers (*recovered*, with the v9 `place()` fix)
+
+```python
+SR = 48000; N = int(END * SR)
+mix = np.zeros((N, 2), np.float32); amb = np.zeros((N, 2), np.float32)    # ambience is kept apart so it can duck under the voice
+def db(x): return 10 ** (x / 20)
+
+USE = {"sea": "578524", "gulls": "537854", "room": "641306", "clock": "434841", "slide_a": ("paper_slide", "464302"),
+       "slide_b": ("paper_slide", "154403"), "settle": ("paper_settle", "406586"), "flutter": "468113", "whoosh": "701104",
+       "tape": "467721", "air": "182868", "typewriter": "406241"}
+CACHE = {}
+def load(key):
+    cat, sid = USE[key] if isinstance(USE[key], tuple) else (key, USE[key])
+    if key not in CACHE:
+        fn = os.path.join(S, "sfx", "raw", f"{cat}_{sid}.mp3")          # rebuild: assets/sfx/raw/<sid>.mp3
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", fn, "-f", "f32le", "-ac", "2", "-ar", str(SR), "-"], capture_output=True).stdout
+        CACHE[key] = np.frombuffer(raw, np.float32).reshape(-1, 2).copy()
+    return CACHE[key]
+
+def seg(x, t0, dur, fi=0.02, fo=0.08):
+    y = x[int(t0 * SR): int((t0 + dur) * SR)].copy(); n = len(y); t = np.arange(n) / SR
+    y *= (np.clip(t / max(fi, 1e-3), 0, 1) * np.clip((n / SR - t) / max(fo, 1e-3), 0, 1))[:, None]
+    return y
+def rms_to(x, d): return x * db(d) / (np.sqrt((x ** 2).mean()) + 1e-9)
+def peak_to(x, d): return x * db(d) / (np.abs(x).max() + 1e-9)
+
+def place(x, t0, pan=None, bus=None):
+    """add a stereo clip at t0; with pan (-1..1, scalar or per-sample) it is folded to mono and panned"""
+    bus = mix if bus is None else bus
+    i0 = int(t0 * SR)
+    if i0 >= N: return
+    if i0 < 0: x = x[-i0:]; i0 = 0
+    x = x[: N - i0]
+    if pan is not None:
+        m = x.mean(1); pan = np.asarray(pan, np.float32); pan = pan[-len(m):] if pan.ndim else pan
+        p = np.broadcast_to(pan, m.shape)
+        x = np.stack([m * np.cos((p + 1) * np.pi / 4), m * np.sin((p + 1) * np.pi / 4)], 1) * 1.414
+    bus[i0:i0 + len(x)] += x
+```
+
+(A per-sample `pan` array longer than the clip after truncation would mis-broadcast; slice it to the clip length.)
+If a source recording is shorter than `t0 + dur` for `seg`, loop it with a short crossfade rather than returning a
+short clip (the sea bed uses offsets 20 s and 110 s).
+
+### 5.3 The voice — NEW clean chain (owner change 3)
+
+Old chain (*recovered*, for reference only — do not reuse):
+```python
+vo = signal.sosfilt(signal.butter(2, 80, "highpass", fs=SR, output="sos"), vo)
+vo = vo / (np.abs(vo).max() + 1e-9) * db(-3)
+vo = peaking(compress(vo, thr_db=-20.0, ratio=2.0), 3200, 2.5, 0.9)
+_e = np.sqrt(signal.sosfilt(signal.butter(1, 6.0, "lowpass", fs=SR, output="sos"), vo ** 2).clip(0))
+_voiced = _e > _e.max() * 0.15
+vo = vo * db(-16.5) / (np.sqrt((vo[_voiced] ** 2).mean()) + 1e-9)
+vo = (np.tanh(vo / db(-1.5)) * db(-1.5)).astype(np.float32)                  # ← the crunch: peaks ≈ +4.3 dBFS go in here
+```
+Measured on the source: peak −1.0 dBFS, voiced RMS −18.1 dBFS, crest 17.2 dB, no clipped samples — the file is clean;
+the old chain alone caused the grit (tanh error ≈ −41 dB RMS, ≈25 dB under the voice).
+
+New chain (spec; the code is new, not recovered):
+
+1. Decode `assets/audio/vo2.wav` (48 kHz mono; if decoding the mp3, `ffmpeg -ac 1 -ar 48000`); float64 for processing.
+2. High-pass: 2nd-order Butterworth at **80 Hz** (`sosfilt`) — keep.
+3. Peak-normalise to −3 dBFS (as before), then **gentle compression**: the recovered `compress()` (feed-forward, 40 Hz
+   RMS detector on a 1 kHz control signal) with `thr_db = −26, ratio = 1.5, att = 0.010, rel = 0.150`, plus a 6 dB soft
+   knee if implemented. Target ≤ 3 dB of gain reduction on the loudest syllables.
+4. Presence EQ: **none** by default (`PRESENCE_DB = 0.0`); allow at most +1.0 dB peaking at 3.2 kHz, Q 0.9, if the voice
+   sinks under the sea in the opening.
+5. Level: scale so the RMS over voiced samples (`_e` > 0.15·max with the 6 Hz envelope, as before) is **−18.0 dBFS**.
+6. **Look-ahead true-peak limiter**, ceiling **−1.0 dBTP**, 5 ms look-ahead, 80 ms release, 4× oversampled peak
+   detection (`tp_limit` below). With the numbers above it should touch only a handful of peaks (report the count and
+   max gain reduction; > 2 dB means the level/compression is wrong).
+7. Place at `A_OFF`: `VO = np.zeros(N); VO[i0:i0+len(vo)] = vo[:N-i0]` with `i0 = int(1.5*SR)`; added to both channels
+   (centre).
+
+Recovered `compress` (reuse with the new settings) and `peaking`:
+
+```python
+def peaking(x, f0, gain_db, q):
+    A = 10 ** (gain_db / 40); w0 = 2 * np.pi * f0 / SR; al = np.sin(w0) / (2 * q); c = np.cos(w0)
+    b = np.array([1 + al * A, -2 * c, 1 - al * A]); a = np.array([1 + al / A, -2 * c, 1 - al / A])
+    return signal.lfilter(b / a[0], a / a[0], x)
+def compress(x, thr_db=-24.0, ratio=2.5, att=0.005, rel=0.12):
+    """feed-forward compressor on a 1 kHz control signal"""
+    dec = SR // 1000
+    lev = np.sqrt(np.maximum(signal.sosfilt(signal.butter(1, 40, "lowpass", fs=SR, output="sos"), x ** 2), 1e-12))[::dec]
+    over = np.maximum(0, 20 * np.log10(lev) - thr_db) * (1 - 1 / ratio)
+    g = np.zeros_like(over); ka, kr = np.exp(-1 / (att * 1000)), np.exp(-1 / (rel * 1000)); cur = 0.0
+    for i, o in enumerate(over):
+        k = ka if o > cur else kr; cur = k * cur + (1 - k) * o; g[i] = cur
+    return x * db(-np.interp(np.arange(len(x)) / dec, np.arange(len(g)), g))
+```
+
+Reference limiter (new; offline, so the look-ahead needs no output delay):
+
+```python
+from scipy import ndimage as ndi
+def tp_limit(x, ceiling_db=-1.0, look_ms=5.0, rel_ms=80.0, os_=4, block=48):
+    """look-ahead true-peak limiter for mono (N,) or linked multichannel (N, C) float arrays"""
+    x2 = x[:, None] if x.ndim == 1 else x
+    n = len(x2); c = db(ceiling_db)
+    up = signal.resample_poly(x2, os_, 1, axis=0)                           # 4x oversampled for inter-sample peaks
+    pk = np.abs(up).max(1)[: n * os_].reshape(n, os_).max(1)                 # per-sample true-peak estimate
+    g_req = np.minimum(1.0, c / np.maximum(pk, 1e-12))                       # gain each sample needs
+    L = max(1, int(look_ms * SR / 1000))
+    g_hold = ndi.minimum_filter1d(g_req, size=L + 1, origin=-(L // 2))      # min over [n, n+L]: reduce before the peak
+    g_att = np.convolve(g_hold, np.hanning(L + 2)[1:-1] / np.hanning(L + 2)[1:-1].sum(), mode="full")[:n]   # smooth ramp over [n-L, n]
+    g_att = np.minimum(g_att, g_hold)                                        # never above the held requirement
+    # release at block rate (1 ms), then back to samples; take the min with the attack curve so peaks stay covered
+    nb = (n + block - 1) // block
+    gb = np.pad(g_att, (0, nb * block - n), constant_values=1.0).reshape(nb, block).min(1)
+    kr = np.exp(-block / (rel_ms * SR / 1000)); out = np.empty(nb); cur = 1.0
+    for i, v in enumerate(gb):
+        cur = v if v < cur else cur * kr + v * (1 - kr); out[i] = cur
+    g = np.minimum(np.interp(np.arange(n), np.arange(nb) * block + block / 2, out), g_att)
+    y = x2 * g[:, None]
+    y = np.clip(y, -c, c)                                                    # safety; should be a no-op
+    return (y[:, 0] if x.ndim == 1 else y).astype(np.float32), g
+```
+
+Verification to print: voiced RMS of the processed voice; number of samples with gain < 0.999 and the minimum gain
+(dB); true peak of the result (4× oversampled) ≤ −1.0 dBTP.
+
+### 5.4 Speech envelope, ducking, ambience and effects (*recovered*, unchanged)
+
+```python
+venv = np.sqrt(signal.sosfilt(signal.butter(1, 6.0, "lowpass", fs=SR, output="sos"), VO ** 2).clip(0))
+speech = np.clip(venv / (venv.max() * 0.35 + 1e-9), 0, 1)
+duck = 1 - 0.62 * speech                                         # about -8 dB under the voice
+
+# ------------------------------------------------------------ ambience
+sea = load("sea")
+place(rms_to(seg(sea, 20.0, T["w3"][1] + 0.3, 1.5, 1.0), -37), 0.0, bus=amb)                      # dusk, until the first paper wipe
+t_n = T["f8"][0] + 0.5
+place(rms_to(seg(sea, 110.0, END - t_n, 1.6, 1.4), -38), t_n, bus=amb)                             # night
+GAPS = [(v(a), v(b)) for a, b in VO_GAPS]                                                         # the pauses between paragraphs, in video time
+place(rms_to(seg(load("gulls"), 2.0, A_OFF + 0.6, 0.4, 0.5), -37), 0.0, bus=amb)                     # distant gulls before his first word
+place(rms_to(seg(load("gulls"), 9.0, GAPS[0][1] - GAPS[0][0] + 0.8, 0.3, 0.6), -38), GAPS[0][0] - 0.1, bus=amb)   # and in the first pause
+place(rms_to(seg(load("room"), 10.0, T["f8"][0] + 0.4 - T["w3"][1], 0.6, 0.8), -52), T["w3"][1], bus=amb)
+for k in ("s3", "s5"):
+    a, b = T[k]; place(rms_to(seg(load("clock"), 5.0 + a % 20, b - a, 0.5, 0.6), -47), a, pan=0.35, bus=amb)
+
+# ------------------------------------------------------------ effects
+wh = load("whoosh")
+place(peak_to(seg(wh, 0.0, min(1.4, len(wh) / SR), 0.15, 0.5), -25), T["w3"][0] - 0.35, pan=np.linspace(0.45, -0.1, int(min(1.4, len(wh) / SR) * SR)))
+for i, k in enumerate(("w4", "w5", "w6", "w7")):
+    a, b = T[k]
+    sl = load("slide_a" if i % 2 == 0 else "slide_b")
+    place(peak_to(seg(sl, 0.0, min(len(sl) / SR, b - a + 0.5), 0.01, 0.2), -21), a - 0.05, pan=0.3 if k in ("w4", "w7") else 0.0)
+    place(peak_to(seg(load("settle"), 0.0, 0.55), -25), b - 0.03)
+
+place(peak_to(seg(load("slide_b"), 0.0, 1.0, 0.01, 0.25), -27), T["s3"][0] + 1.2, pan=0.55)        # the letter slides in from the right
+place(peak_to(seg(load("settle"), 0.0, 0.4), -33), T["s3"][0] + 0.75, pan=-0.35)                    # the envelope lands in his head
+
+def flight(t0, dur, pan0, pan1, launch_gain, whoosh_gain):
+    fl = load("flutter"); wh = load("whoosh")
+    place(peak_to(seg(fl, 0.0, min(1.2, len(fl) / SR), 0.01, 0.4), launch_gain), t0, pan=pan0)
+    w = seg(wh, 0.0, len(wh) / SR, 0.05, 0.4); n = len(w)
+    place(peak_to(w, whoosh_gain), t0 + max(0.0, (dur - n / SR) / 2), pan=np.linspace(pan0, pan1, n))
+flight(T["s2"][0] + FLY_OUT[0], FLY_OUT[1], -0.7, 0.55, -24, -25)
+flight(T["s8"][0] + FLY_HOME[0], FLY_HOME[1], 0.5, -0.5, -30, -23)
+place(peak_to(seg(load("flutter"), 0.2, 0.9, 0.02, 0.4), -24), T["s8"][0] + FLY_HOME[0] + FLY_HOME[1] - 0.3, pan=-0.5)   # it arrives, close
+
+place(peak_to(seg(load("slide_b"), 0.0, 0.45, 0.01, 0.15), -30), T["s6"][0] + IT_SWEEP, pan=-0.15)  # highlighter swipe on "it"
+place(peak_to(seg(load("slide_b"), 0.0, 0.45, 0.01, 0.15), -31), T["s7"][0] + ANNOT[0], pan=-0.3)   # scene 7: the swipe on "it",
+place(peak_to(seg(load("slide_a"), 0.1, 0.7, 0.05, 0.2), -35), T["s7"][0] + ANNOT[1], pan=np.linspace(-0.2, 0.2, int(0.7 * SR)))   # the pen arrow,
+place(peak_to(seg(load("slide_b"), 0.0, 0.5, 0.01, 0.15), -31), T["s7"][0] + ANNOT[2], pan=-0.35)   # and the swipe on "spinach omelette"
+
+for i in range(3):                                                                                  # letters land and are taped down
+    t0 = T["s7"][0] + CARD0 + CARD_GAP * i
+    place(peak_to(seg(load("slide_a"), 0.0, 0.5, 0.01, 0.15), -27), t0, pan=-0.4)
+    place(peak_to(seg(load("settle"), 0.0, 0.45), -25), t0 + 0.42, pan=-0.4)
+    place(peak_to(seg(load("tape"), 0.0, 0.7, 0.01, 0.2), -25), t0 + 0.48, pan=-0.3)
+
+place(rms_to(seg(load("air"), 0.0, 6.0, 1.0, 2.2), -40), T["s5"][0] + FORGET, pan=0.35)            # the words leave his head
+```
+
+Event table in absolute time (from the code above):
+
+| t (s) | sound | gain | pan |
+|---|---|---|---|
+| 0.00–18.50 | sea bed (src 20 s→), fade in 1.5 / out 1.0 | RMS −37 | — |
+| 0.00–2.10 | gulls (src 2 s), fades 0.4/0.5 | RMS −37 | — |
+| 9.84–11.96 | gulls (src 9 s), fades 0.3/0.6 | RMS −38 | — |
+| 14.46 | flutter launch (≤1.2 s) | peak −24 | −0.7 |
+| 14.46 + (2.4 − len)/2 | whoosh, panned −0.7 → +0.55 | peak −25 | sweep |
+| 17.15 | w3 whoosh (≤1.4 s), fades 0.15/0.5 | peak −25 | +0.45 → −0.1 |
+| 18.20–61.57 | room tone (src 10 s), fades 0.6/0.8 | RMS −52 | — |
+| 18.20–24.10 | clock (src 5 + 18.2 % 20 = 23.2 s), fades 0.5/0.6 | RMS −47 | +0.35 |
+| 18.95 | settle (0.4 s) — envelope lands in his head | peak −33 | −0.35 |
+| 19.40 | slide_b (1.0 s) — letter slides in | peak −27 | +0.55 |
+| 24.05 | slide_a (w4) | peak −21 | +0.3 |
+| 24.67 | settle (0.55 s) | peak −25 | — |
+| 25.30→29.38 | typewriter, reply, 24 cps | −26 ±1.5 (spaces −5) | +0.05 ± 0.08 |
+| 29.44 | slide_b (w5) | peak −21 | 0 |
+| 30.16 | settle | peak −25 | — |
+| 30.19–40.90 | clock (src 5 + 30.19 % 20 = 15.19 s) | RMS −47 | +0.35 |
+| 32.79–38.79 | air (6 s), fades 1.0/2.2 | RMS −40 | +0.35 |
+| 40.85 | slide_a (w6) | peak −21 | 0 |
+| 41.47 | settle | peak −25 | — |
+| 43.00→45.31 | typewriter, Q2, 16 cps | −27 | −0.05 |
+| 45.80→46.94 | typewriter, "Make what, dear?", 14 cps | −26 | +0.05 |
+| 47.50 | slide_b swipe on "it" (0.45 s) | peak −30 | −0.15 |
+| 49.32 | slide_b (w7) | peak −21 | +0.3 |
+| 49.94 | settle | peak −25 | — |
+| 52.67 / 53.87 / 55.07 | slide_a (0.5 s) | peak −27 | −0.4 |
+| +0.42 | settle (0.45 s) | peak −25 | −0.4 |
+| +0.48 | tape (0.7 s) | peak −25 | −0.3 |
+| 57.07 | slide_b swipe on "it" | peak −31 | −0.3 |
+| 57.57 | slide_a from 0.1 s, 0.7 s, pen arrow | peak −35 | −0.2 → +0.2 |
+| 58.27 | slide_b swipe on "spinach omelette" (0.5 s) | peak −31 | −0.35 |
+| 59.17→61.09 | typewriter, ANS2, 24 cps | −26 | +0.3 |
+| 61.67–72.05 | night sea (src 110 s), fades 1.6/1.4 | RMS −38 | — |
+| 63.17 | flutter launch | peak −30 | +0.5 |
+| centred in 63.17–67.37 | whoosh +0.5 → −0.5 | peak −23 | sweep |
+| 67.07 | flutter (src 0.2 s, 0.9 s) — arrives close | peak −24 | −0.5 |
+
+### 5.5 Typewriter (*recovered*)
+
+```python
+tw = load("typewriter"); twm = tw.mean(1)
+env = np.convolve(np.abs(twm), np.ones(96) / 96, "same"); de = np.diff(env, prepend=0); thr = env.max() * 0.25
+onsets, last = [], -SR
+for i in np.where((env > thr) & (de > 0))[0]:
+    if i - last > int(0.12 * SR): onsets.append(i)
+    last = i
+KEYS = []
+for o in onsets:
+    k = tw[max(0, o - int(0.004 * SR)): o + int(0.11 * SR)].copy(); n = len(k)
+    k *= np.clip(np.arange(n) / (0.002 * SR), 0, 1)[:, None] * np.clip((n - np.arange(n)) / (0.03 * SR), 0, 1)[:, None]
+    KEYS.append(peak_to(k, 0))
+rk = np.random.default_rng(31)
+def typing(text, t0, cps, gain=-26, pan=0.0):
+    prev = -1
+    for i, ch in enumerate(text):
+        j = int(rk.integers(len(KEYS)))
+        if j == prev: j = (j + 1) % len(KEYS)
+        prev = j
+        g = gain - (5 if ch == " " else 0) + rk.uniform(-1.5, 1.5)
+        place(KEYS[j] * db(g), t0 + i / cps + rk.uniform(-0.008, 0.008), pan=pan + rk.uniform(-0.08, 0.08))
+REPLY = "A spinach omelette. Wilt the spinach in butter, pour in three beaten eggs, fold it over and serve."
+typing(REPLY, T["s4"][0] + REPLY_TYPE[0], REPLY_TYPE[1], pan=0.05)
+typing("Thanks! Can you make it without eggs?", T["s6"][0] + Q2_TYPE[0], Q2_TYPE[1], gain=-27, pan=-0.05)
+typing("Make what, dear?", T["s6"][0] + ANS_TYPE[0], ANS_TYPE[1], pan=0.05)
+typing("Without eggs? Try spinach and cheese on toast.", T["s7"][0] + ANS2_TYPE[0], ANS2_TYPE[1], pan=0.3)
+```
+
+(About 18 distinct keystrokes were found in recording 406241. The picture's character counts use `twos()`, so sound
+leads picture by ≤ 1/12 s — accepted.)
+
+### 5.6 Music — track mode, **without the "Gone" gate** (owner change 1)
+
+v9 track-mode code (*recovered*), shown with the gate that must go:
+
+```python
+music = np.zeros((N, 2), np.float32)
+tt_ = np.arange(N) / SR
+# Josh's reference track as the bed. Its sparse opening sits under the sky; its groove arrives around the uncle.
+raw = subprocess.run(["ffmpeg", "-v", "error", "-i", os.path.join(S, "sfx", "ref_jamal.mp3"), "-f", "f32le", "-ac", "2", "-ar", str(SR), "-"], capture_output=True).stdout
+trk = np.frombuffer(raw, np.float32).reshape(-1, 2).copy()[:N]
+music[: len(trk)] = trk
+music *= (db(-16.5) * (1 + (db(6.0) - 1) * np.clip((18.0 - tt_) / 3.0, 0, 1)))[:, None]   # its quiet intro lifted a little
+back = T["s6"][0]
+music *= (1 - 0.55 * speech)[:, None]
+lift = np.clip((tt_ - (v(VO_END) - 0.3)) / 0.8, 0, 1)                         # up a little for the ending
+music *= (1 + 0.6 * lift)[:, None]
+# under the voice, keep the band the words live in a little clearer
+_bs = np.stack([signal.sosfilt(signal.butter(2, [700, 4000], "bandstop", fs=SR, output="sos"), music[:, c]) for c in range(2)], 1)
+music = (music * (1 - 0.5 * speech)[:, None] + _bs * (0.5 * speech)[:, None]).astype(np.float32)
+# "Gone": the music stops with the room, and comes back with the fix          <-- DELETE these two lines in the rebuild
+mq = 1 - np.clip((tt_ - (GONE - 0.12)) / 0.12, 0, 1) * np.clip((back + 0.02 - tt_) / 0.9, 0, 1)
+music *= mq[:, None]
+# (track mode had no reverb: the fftconvolve reverb was multiplied by 0.0)
+```
+
+Rebuild settings, explicitly:
+- Track from its own t = 0, aligned to video t = 0, stereo, 48 kHz; truncated at `END` (the track is 172.46 s).
+- Gain: −16.5 dB, plus a lift of +6 dB (×1.995) for t < 15 s that ramps linearly to 0 dB between 15 and 18 s
+  (the track's first ≈16 s are nearly silent: its RMS is −27/−28 dB for 0–16 s, then ≈ −15 dB).
+- Duck: `× (1 − 0.55·speech)` (≈ −7 dB at full speech).
+- Speech-band clearing: blend in a 2nd-order Butterworth 700–4000 Hz band-stopped copy by `0.5·speech`.
+- End lift: `× (1 + 0.6·lift)` with `lift` ramping 0 → 1 over 68.75 → 69.55 s (+4.1 dB at the end).
+- **No `mq` gate** — the music is continuous through "Gone" (39.61) and s6.
+- No reverb.
+- Old v9 music-stem levels for orientation (RMS dBFS): pre-roll 0–1.5 s −31.1; gaps −36.5, −32.2, −32.0, −29.0,
+  [gap 5 was −39.7 because of the gate; expect ≈ −30 now], −28.3, −33.7; under the voice v(2)–v(8) −36.5, v(30)–v(37) −31.3;
+  tail −29.4.
+- Track facts (analysed in October): ≈ 89 BPM, warm deep bass, rolled-off top, minor colour (chroma D, A strongest),
+  ≈ 3.4 onsets/s. Licence unknown — keep `ref_jamal.mp3` out of git; warn before public posting.
+
+### 5.7 Ambience around "Gone"
+
+v9 also dropped the room and clock out around "Gone" (*recovered*):
+
+```python
+GONE = v(38.11)
+quiet = 1 - np.clip((np.arange(N) / SR - (GONE - 0.15)) / 0.15, 0, 1) * np.clip((T["s6"][0] + 0.6 - np.arange(N) / SR) / 0.6, 0, 1)
+amb *= quiet[:, None]
+```
+
+The owner asked for no pause at "Gone". With the music now continuous this ambience dip is barely audible, but to honour
+the request **default it off** (`AMB_GONE_DIP = False`); keep the code behind the flag. (Judgement call — see §6.)
+
+### 5.8 Mix and master — NEW limiter (owner change 3)
+
+Recovered v9 mix, then the change:
+
+```python
+amb_bs = np.stack([signal.sosfilt(signal.butter(2, [900, 4500], "bandstop", fs=SR, output="sos"), amb[:, c]) for c in range(2)], 1)
+amb = amb * (1 - speech)[:, None] + amb_bs * speech[:, None]                  # the sea loses its hiss under the voice
+out = mix + music + amb * duck[:, None] + VO[:, None]
+if os.environ.get("STEMS"):
+    for nm, x in (("fx", mix), ("music", music), ("amb", amb * duck[:, None])):
+        wavfile.write(sys.argv[1].replace(".wav", f"_{nm}.wav"), SR, (np.clip(x, -1, 1) * 32767).astype(np.int16))
+t = np.arange(N) / SR
+out *= np.clip((END - t) / 1.2, 0, 1)[:, None]                                 # master fade over the last 1.2 s (70.85 → 72.05)
+peak = np.abs(out).max()
+out = np.tanh(out / db(-1.0)) * db(-1.0)                                       # <-- REPLACE
+wavfile.write(sys.argv[1], SR, (np.clip(out, -1, 1) * 32767).astype(np.int16))
+print(f"saved {sys.argv[1]}: {N / SR:.2f}s, pre-limiter peak {20 * np.log10(peak):.1f} dBFS")
+```
+
+Rebuild master:
+- Replace the tanh with `out, g = tp_limit(out, ceiling_db=-1.0, look_ms=5.0, rel_ms=80.0)` (stereo-linked gain).
+  v9's pre-limiter mix peak was ≈ −1.8 to −2.1 dBFS **with** the hot voice; with the −18 dB voice the limiter should
+  rarely engage.
+- Write 24-bit PCM (or 32-bit float) WAV; if 16-bit is required, add TPDF dither (±1 LSB).
+- Add a `VO_STEM` export (the processed voice alone) to the `STEMS=1` outputs so the voice can be checked in isolation.
+- Print: voice RMS in the window v(2)–v(2.8) (old v9: −20.4 dB before the +1.5 dB nudge; target ≈ −18 ± 0.5 in the voice
+  stem), mix true peak (≤ −1.0 dBTP), limiter gain-reduction stats, music and ambience levels per gap, and an approximate
+  integrated loudness (BS.1770 K-weighting; expected ≈ −18 to −16 LUFS — report, do not normalise to it).
+- The mux re-encodes to AAC 192 k; −1.0 dBTP leaves headroom for codec overshoot.
+
+---
+
+## 6. Known differences and uncertainties (use judgement here)
+
+Lost outright (rebuild from description + reference frames):
+1. **Uncle scene code**: full head/body polygons (only the tail of the head list, the start of the body list and the
+   collar survive), unit→pixel mapping, brushwork/speckle parameters, the exact `pivot`/`split`/`lens` values, the
+   background lamp glow, and the breathing loop formula. Match the measured silhouette (§3.3) and
+   `docs/ref/canvas_v6/uncle.jpg`.
+2. **Paper plates' recipe** (use the canvas plates, believed final).
+3. **`ep4_scenes.py` header** (lines 1–35): seeds, `PAPER_RGB`, `EDGE_TOOTH` default, `TEX` override (if any), `save()` quality.
+4. **`fly()`** body, **`PATH_OUT` / `PATH_HOME`** control points (canvas storyboard curves used here), dot size/spacing.
+5. **`envelope()`**, **`tape()`**, the full **`card()`** layout (padding, paragraph gap, label size, shadow) and
+   `C2_ARGS`/`C3_ARGS` widths and rotations.
+6. **`prompt_box()`** after the height computation (outline radius/stroke, highlight padding).
+7. **`sheet()`** (torn edge generator, lip, shadow), and the w5/w6 call arguments. Note the measured asymmetry: w5 moves
+   the outgoing sheet; w4/w6/w7 reveal the incoming sheet with static content.
+8. **`light_rush()` / `resolve()` / `zoom_at()`** bodies and `_RD` (≈0.715 s inferred), the glow colour/radius curve.
+9. **Bird sprite** drawing and the exact glide modulation.
+10. **The drifting-words motion** (emergence, per-word drift speeds); only the word list and final layout offsets are exact.
+11. **Head tilt amplitude / timing** (≈1.5–2°, measured indirectly), the dry glint timing.
+12. **Picture end fade** — measured (≈70.90 → 71.95), not recovered.
+13. **Main render loop / ffmpeg pipe**, `frame()` order beyond the recovered branches.
+14. **Exact final VO script** — the canvas storyboard text is a draft; the voice file is the authority (timings in §2.3).
+
+Recovered but with caveats:
+- `bez(p0,p1,p2,p3,u)` in the video module is a cubic with a parameter (different from the engine's quadratic list
+  version); its body is the standard formula (not seen).
+- The engine has changed since October (RULES-56 `ref_canvas` etc.). The dusk/night recipe only uses functions whose
+  signatures are unchanged; results will not be pixel-identical to v9 plates (texture offsets / rng draws may differ).
+  That is acceptable — compare by eye against §8.
+- Fonts: families/weights are certain (canvas `<link>`), the exact conversion route is not.
+- Grain plates: present in code, probably not applied (owner declined the "grain standard"). Leave off.
+- Ambience dip at "Gone": spec defaults it **off** (owner disliked the pause); if the owner meant music only, set
+  `AMB_GONE_DIP = True` (restores v9's room/clock drop-out).
+- The reference video still shows the "EPISODE 4" tag, the music gate and the old voice chain — do **not** match
+  those three.
+- The old summary said the voice sat at "−18 dB RMS" then "−16.5" (the +1.5 dB nudge was in v7+). The rebuild target is
+  −18 dBFS voiced RMS on the voice stem.
+
+---
+
+## 7. Suggested module split for the rebuild
+
+```
+painterly-explainers/
+  engine/                  vendored painterly engine (+ tex/ via fetch_textures.sh)
+  assets/fonts/            mono.ttf mono5.ttf sans.ttf serif.ttf serif_i.ttf serif_b.ttf
+  assets/sfx/raw/<id>.mp3  + manifest.json, credits.md
+  assets/audio/            vo2.wav (48 k mono), vo_sekou.mp3, ref_jamal.mp3 (git-ignored)
+  ep4/
+    timeline.py            = §2.1 verbatim (+ in_, frac, local helpers)
+    backdrops.py           = ep4_scenes.py: SCENE dusk/night/uncle/paper_*; NOCLOUDS, WINDOW_OFF; writes out/ep4/*.jpg|png|npz
+    common.py              W,H,F, ease/ease_io/twos, load(), font(), comp(), INK, HL, rough(), tracked(), cubic bez()
+    seasky.py              prep_masks, shift_rows*, cloud_layer, glints, living_sea, push/cam_box/push_box/apply_box,
+                           SKYFILL + parallax, birds, fly()/PATH_OUT/PATH_HOME/envelope trail
+    uncle.py               uncle layers (bg/body/head/collar), breathing, tilt, window()/hole + icon, glint,
+                           drifting words, scene_reads(lt), scene_forget(lt)
+    cards.py               tag/title_reveal, wrap/text_block/prompt_box, card()/anchors/card_marked, tape(), envelope(),
+                           ink_arrow, scene_reply(lt), scene_second(lt, static), scene_history(t, static)
+    transitions.py         light_rush/resolve (w3), sheet() (w4–w7), f8 dip, end fade
+    video.py               scene_dusk, scene_night, frame(t) dispatcher, render loop (ffmpeg pipe), CLI OUT [t0 t1]
+    audio.py               = ep4_audio2.py track mode: voice chain + tp_limit, ambience, sfx, typewriter, music, master, stems, credits
+```
+
+Interfaces:
+- **backdrops → everything**: files in `out/ep4/` (names in §3.1). `*_masks.npz` keys `land`, `land_shape`, `hz`, `win`.
+  `uncle_geo.npz` keys `pivot` (x,y px), `split` (y px), `lens` (x,y px).
+- **common**: `ease(p)`, `ease_io(p)`, `twos(t)`; `load(name) -> float32 HxWx3`; `font(key, px) -> FreeTypeFont`;
+  `comp(base_f32, lay_rgba) -> PIL RGBA`; `rough(im_rgba, amp, size, seed, fine) -> PIL RGBA`; constants `W=1920, H=1080, F=1.5,
+  INK=(46,44,45), HL=(245,212,74)`.
+- **seasky**: `living_sea(img, K, t, night=False, on=1.0) -> f32`; `parallax(base, dy) -> f32`;
+  `cam_box(s, cx, cy) -> (x0, y0, s)`, `push_box(t, dur, focus, amount) -> (x0, y0, s)`, `apply_box(pil, box) -> pil`,
+  `push(pil, t, dur, focus, amount) -> pil`; `birds(pil, t, to_screen, scale)` (in place);
+  `fly(lay, path, u, size0, size1, rot0, rot1, t, dot_rgba)` (in place); `KD, KN, KD_win, KN_win, LIGHT_D, DUSK, NIGHT`.
+- **uncle**: `scene_reads(lt) -> f32`, `scene_forget(lt) -> f32`; also `uncle_frame(lt, tilt, open_frac, icon, extra_lay=None) -> f32`
+  for the transitions; constants `WIN_C=(537.1, 315.8)`, `WIN_R=93`.
+- **cards**: `title_reveal(lt, dur) -> RGBA layer`; `scene_reply(lt)`, `scene_second(lt, static=False)`,
+  `scene_history(t_local, static=False) -> f32`.
+- **transitions**: `rush_resolve(t) -> f32` (covers 17.50–18.60, calls `scene_dusk` and `scene_reads`);
+  `sheet(a_f32, b_f32, p, direction, seed) -> f32`; `dip(t) -> f32` for f8; `end_fade(img, t)`.
+- **video**: `frame(t) -> f32`; CLI `python3 -m ep4.video OUT.mp4 [t0 t1]` / `OUT.png t`.
+- **audio**: CLI `python3 -m ep4.audio OUT.wav` (env `STEMS=1`, `AMB_GONE_DIP=0|1`, `PRESENCE_DB`); reads only
+  `timeline.py` and assets; writes the WAV, stems (`_fx`, `_music`, `_amb`, `_vo`) and `credits.md`.
+- **mux**: `ffmpeg -i video.mp4 -i mix.wav -map 0:v -map 1:a -c:v libx264 -crf 21 -preset slow -pix_fmt yuv420p -c:a aac -b:a 192k -shortest ep4_v10.mp4`
+  (or `-c:v copy` if the video is already final-encoded).
+
+Build order suggestion: timeline+common → backdrops (dusk/night first; check masks) → seasky (s1/s2/s8 stills at
+3.0, 6.5, 12.0, 16.5, 66.0) → uncle → cards → transitions → audio (independent; can run in parallel from the start).
+
+---
+
+## 8. Reference timestamps per scene (compare against `/home/claude/ref/ep4_v9_track.mp4`)
+
+Extract with `ffmpeg -i ep4_v9_track.mp4 -vf "select=eq(n\,FRAME)" -frames:v 1 ref.png` (frame = round(t·24)). Do not
+use `ref/frames/f_*.jpg` for timing (offset up to +0.2 s). Remember: the reference has the EPISODE 4 tag (5.6–10.6 s).
+
+| scene | frame (t) | what to compare |
+|---|---|---|
+| s1 | 0 (0.000) | zoom-2 view of the dusk sky only; three gulls at ≈ (488,361), (669,287), (850,464); pink-left / lilac-right gradient, faint cloud wisps |
+| s1 | 72 (3.000) | mid-tilt: horizon at y ≈ 850 of the frame, hill entering bottom-right, house at the right edge; parallax visible (hill/sea offset vs sky) |
+| s1 | 120 (5.000) | tilt complete, full frame: horizon y 626, hill top + cottage at ≈ (1500, 480), window lit, glints under it |
+| s1 | 156 (6.500) | title tag fully in (rebuild: only the light tag "THE UNCLE WHO ONLY READS LETTERS", bottom-left at (96, 916–984)) |
+| s2 | 288 (12.000) | push-in ≈3 % toward the window; gulls top centre; cloud drift vs 5.0 s |
+| s2 | 360 (15.000) | envelope entering large at the bottom-left corner, −14° |
+| s2 | 396 (16.500) | envelope small near the house, dotted trail arcing from bottom-left |
+| w3 | 425 (17.708), 428 (17.833) | rush: zoom into the window, blur, warm wash |
+| w3 | 432 (18.000), 436 (18.167) | resolve: uncle enlarged about the hole (≈1.67×, ≈1.37×), blurred, warm wash |
+| s3 | 446 (18.583) | settled uncle, empty hole at (537,316) r 93 |
+| s3 | 461 (19.208) | envelope icon full in the hole (≈100 px) |
+| s3 | 470 (19.583) | letter card sliding in from the right |
+| s3 | 552 (23.000) | head nodded; letter card at rest x 1134–1775, y 271–806 |
+| w4 | 583 (24.292) | yellow torn edge at x ≈ 600 moving left; prompt box text behind it at its final place |
+| s4 | 600 (25.000) | prompt box + "…" |
+| s4 | 696 (29.000) | reply typed to "fold it over" + cursor |
+| w5 | 710 (29.583) | yellow sheet slid down to y ≈ 372 with its content; uncle (with icon) static above |
+| s5 | 790 (32.917) | icon shrinking, "spinach" emerging at the face |
+| s5 | 864 (36.000) | full word cloud (spinach, eggs, tonight, Dear Uncle, Sam, omelette, butter, fold, cook) |
+| s5 | 950 (39.583) | words almost gone; hole starting to close |
+| s5 | 972 (40.500) | head solid, no hole |
+| w6 | 984 (41.000) | pink torn edge rising (≈ y 622), light shadow band on the uncle |
+| s6 | 1008 (42.000) | empty prompt box at (360,285)–(1560,430) on pink |
+| s6 | 1104 (46.000) | "Make what" typing |
+| s6 | 1164 (48.500) | complete: "it" highlighted yellow in the box, "Make what, dear?" |
+| w7 | 1187 (49.458) | cream torn edge at x ≈ 1186 moving left |
+| s7 | 1272 (53.000) | card 1 dropping (scaled, slightly high) |
+| s7 | 1344 (56.000) | three cards + tapes |
+| s7 | 1380 (57.500) | "it" highlighted, arrow starting |
+| s7 | 1416 (59.000) | arrow complete, "spinach omelette" highlighted, "…" at (1140,450) |
+| s7 | 1464 (61.000) | ANS2 typed to "toa" |
+| f8 | 1476 (61.500) | half-dark s7; 1488 (62.000) dark night fading up |
+| s8 | 1512 (63.000) | night, glowing window, gold reflection, no envelope yet |
+| s8 | 1584 (66.000) | envelope mid-flight (≈ 240 px wide, centre ≈ (720, 840)) with gold dotted trail |
+| s8 | 1680 (70.000) | envelope ≈300 px at ≈ (527, 872), trail back to the window |
+| s8 | 1716 (71.500) | fading to black (≈ 40 % luma) |
+
+Audio checkpoints (rebuild vs reference audio `ref/v9_track_audio.wav`): music audible and continuous across 38–42 s
+(the reference has silence there — intended difference); voice clean on sibilants and plosives at 2.0–8.4 s and on
+"Gone" (39.61); typing audible under the voice at 25–29 s; whoosh at 17.15; paper slides at each wipe; tape thuds at
+53.1 / 54.4 / 55.6.
