@@ -1,0 +1,15 @@
+# Render outputs
+out/
+renders/
+*.mp4
+engine/out*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# Re-fetchable CC0 texture scans (run engine/fetch_textures.sh)
+engine/tex/
+
+# Third-party music reference, licence unknown: never commit
+assets/audio/ref_jamal.mp3

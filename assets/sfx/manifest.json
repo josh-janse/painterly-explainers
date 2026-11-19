@@ -1,0 +1,150 @@
+{
+  "source": "Freesound HQ preview mp3s (fetch with tools/fetch_sfx.py)",
+  "note": "title/author/licence null = not listed in credits.md; check the page and fill in before publishing.",
+  "sounds": {
+    "sea": {
+      "id": 578524,
+      "title": "Calm ocean waves",
+      "author": "SamsterBirdies",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/578524/",
+      "file": "assets/sfx/raw/578524.mp3"
+    },
+    "gulls": {
+      "id": 537854,
+      "title": "Seagulls distant.wav",
+      "author": "Ambientsoundapp",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/537854/",
+      "file": "assets/sfx/raw/537854.mp3"
+    },
+    "room": {
+      "id": 641306,
+      "title": "House Room Tone",
+      "author": "aleclubin",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/641306/",
+      "file": "assets/sfx/raw/641306.mp3"
+    },
+    "clock": {
+      "id": 434841,
+      "title": "Kitchen Wall Clock Ticking 2",
+      "author": "giddster",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/434841/",
+      "file": "assets/sfx/raw/434841.mp3"
+    },
+    "slide_a": {
+      "id": 464302,
+      "title": "PaperSlide.wav",
+      "author": "eyesonlegs",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/464302/",
+      "file": "assets/sfx/raw/464302.mp3"
+    },
+    "slide_b": {
+      "id": 154403,
+      "title": "paper slide.wav",
+      "author": "semccab",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/154403/",
+      "file": "assets/sfx/raw/154403.mp3"
+    },
+    "settle": {
+      "id": 406586,
+      "title": "Picture Drop_Heavy Paper_Near_Mono",
+      "author": "_stubb",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/406586/",
+      "file": "assets/sfx/raw/406586.mp3"
+    },
+    "flutter": {
+      "id": 468113,
+      "title": "Flutter.wav",
+      "author": "Aquafeniz",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/468113/",
+      "file": "assets/sfx/raw/468113.mp3"
+    },
+    "whoosh": {
+      "id": 701104,
+      "title": "Whoosh stereo light (transition)",
+      "author": "xkeril",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/701104/",
+      "file": "assets/sfx/raw/701104.mp3"
+    },
+    "tape": {
+      "id": 467721,
+      "title": "Free Tape Ripping Sound",
+      "author": "MilkyGacha",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/467721/",
+      "file": "assets/sfx/raw/467721.mp3"
+    },
+    "air": {
+      "id": 182868,
+      "title": "Sandy Breeze (foley)",
+      "author": "FableVision_Studios",
+      "licence": "CC0",
+      "page": "https://freesound.org/s/182868/",
+      "file": "assets/sfx/raw/182868.mp3"
+    },
+    "typewriter": {
+      "id": 406241,
+      "title": null,
+      "author": null,
+      "licence": null,
+      "page": "https://freesound.org/s/406241/",
+      "file": "assets/sfx/raw/406241.mp3"
+    },
+    "shaker": {
+      "id": 375639,
+      "title": null,
+      "author": null,
+      "licence": null,
+      "page": "https://freesound.org/s/375639/",
+      "file": "assets/sfx/raw/375639.mp3"
+    },
+    "snap": {
+      "id": 332604,
+      "title": null,
+      "author": null,
+      "licence": null,
+      "page": "https://freesound.org/s/332604/",
+      "file": "assets/sfx/raw/332604.mp3"
+    },
+    "rim": {
+      "id": 82280,
+      "title": null,
+      "author": null,
+      "licence": null,
+      "page": "https://freesound.org/s/82280/",
+      "file": "assets/sfx/raw/82280.mp3"
+    },
+    "kick": {
+      "id": 371192,
+      "title": null,
+      "author": null,
+      "licence": null,
+      "page": "https://freesound.org/s/371192/",
+      "file": "assets/sfx/raw/371192.mp3"
+    },
+    "bass": {
+      "id": 383711,
+      "title": null,
+      "author": null,
+      "licence": null,
+      "page": "https://freesound.org/s/383711/",
+      "file": "assets/sfx/raw/383711.mp3"
+    },
+    "kalimba": {
+      "id": 331047,
+      "title": null,
+      "author": null,
+      "licence": null,
+      "page": "https://freesound.org/s/331047/",
+      "file": "assets/sfx/raw/331047.mp3"
+    }
+  }
+}
