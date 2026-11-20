@@ -1,6 +1,10 @@
 """Shared picture helpers for the ep4 rebuild (SPEC §1.2, §1.5, §4.1, §4.4.4, §4.8).
 
-Everything here is in output pixels (1920 x 1080). Layout numbers in the spec written `NN*F` are in 1280-space.
+Everything here is in output pixels. Two formats (docs/REEL_LAYOUT.md §4), picked by the env var EP4_FORMAT:
+    landscape (default)  1920 x 1080, plates and intermediates in out/ep4/ (the approved film)
+    reel                 1080 x 1920, plates and intermediates in out/ep4_reel/ (never overwrites the approved plates)
+Layout numbers in the spec written `NN*F` are in 1280-space and apply to the landscape tables only; the reel tables in
+ep4/layout.py are written in output px. Per-format positions, sizes and fonts live in ep4/layout.py (`L.<name>`).
 """
 import math
 import os
@@ -10,12 +14,19 @@ import scipy.ndimage as ndi
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-A = os.path.join(ROOT, "out", "ep4")                # backdrop outputs (ep4.backdrops writes here)
+FORMAT = os.environ.get("EP4_FORMAT", "landscape").strip().lower() or "landscape"    # "landscape" | "reel"
+if FORMAT not in ("landscape", "reel"):
+    raise ValueError(f"EP4_FORMAT must be 'landscape' or 'reel', not {FORMAT!r}")
+REEL = FORMAT == "reel"
+A = os.path.join(ROOT, "out", "ep4_reel" if REEL else "ep4")   # backdrop plates + intermediates (ep4.backdrops writes here)
+A_LANDSCAPE = os.path.join(ROOT, "out", "ep4")                 # the approved landscape plates (read-only source)
 FONTS = os.path.join(ROOT, "assets", "fonts")
 
-W, H = 1920, 1080
+W, H = (1080, 1920) if REEL else (1920, 1080)
 FPS = 24
-F = 1.5                                    # layout scale from the 1280 x 720 canvas frames
+F = 1.5                                    # layout scale from the 1280 x 720 canvas frames (landscape tables only)
+# where text and key action must sit: the Reels/Shorts safe box (x0, y0, x1, y1); landscape has no UI, so the full frame
+SAFE = (60, 250, 960, 1470) if REEL else (0, 0, W, H)
 
 # ---- palette (§1.5) ----
 INK = (46, 44, 45)                         # text, prompt-box outline, arrow, dark tag bg
@@ -44,7 +55,7 @@ def clamp01(p): return min(max(p, 0.0), 1.0)
 # ---- images ----
 _LOADED = {}
 def load(name):
-    """float32 RGB 0-1 array (H x W x 3) of out/ep4/<name>, resized to W x H if needed. Cached; treat as read-only."""
+    """float32 RGB 0-1 array (H x W x 3) of <A>/<name>, resized to W x H if needed. Cached; treat as read-only."""
     if name not in _LOADED:
         im = Image.open(os.path.join(A, name)).convert("RGB")
         if im.size != (W, H): im = im.resize((W, H), Image.LANCZOS)
@@ -52,7 +63,7 @@ def load(name):
     return _LOADED[name]
 
 def load_rgba(name):
-    """PIL RGBA image of out/ep4/<name> at W x H (e.g. uncle_fig.png, uncle_collar.png)"""
+    """PIL RGBA image of <A>/<name> at W x H (e.g. uncle_fig.png, uncle_collar.png)"""
     im = Image.open(os.path.join(A, name)).convert("RGBA")
     return im if im.size == (W, H) else im.resize((W, H), Image.LANCZOS)
 
