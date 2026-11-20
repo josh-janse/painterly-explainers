@@ -16,17 +16,20 @@ import os
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-from ep4.common import (A, F, H, INK, W, CARD_PAPER, ENV_FLAP, ENV_FOLD, ENV_PAPER, ENV_STAMP, blank, ease,
+from ep4.common import (A, F, H, INK, REEL, W, CARD_PAPER, ENV_FLAP, ENV_FOLD, ENV_PAPER, ENV_STAMP, blank, ease,
                         ease_io, font, rough, to_f32, twos)
 from ep4 import timeline as TL
+from ep4 import layout as L
 
-WIN_C = (0.27975 * W, 0.2924 * H)          # (537.1, 315.8): the hole, in the head's rest pose (recovered)
-WIN_R = 62 * F                             # 93 px
+# per-format values (ep4/layout.py; landscape verbatim). Reel: the figure is the landscape one mapped by L.U (1.25x).
+WIN_C = L.WIN_C                            # landscape (537.1, 315.8); reel (240.1, 779.8): the hole, head at rest
+WIN_R = L.WIN_R                            # landscape 93 px; reel 116.25 px
+FIG_K = L.UNCLE_MAP["scale"]               # figure scale vs landscape (1.0 / 1.25): sizes the lens glint
 
 READ_DEG = 2.0                             # the read-nod: head forward (nose down) about the neck pivot, degrees
 BREATH_T = 4.6                             # breathing period, s
-BREATH_HEAD, BREATH_BODY = 2.2, 1.2        # px amplitude (measured: head top 169-175, shoulders 663-666)
-ICON_W = 112                               # envelope paper width in the hole when icon = 1 (measured)
+BREATH_HEAD, BREATH_BODY = L.BREATH_HEAD, L.BREATH_BODY   # px amplitude (landscape measured: head top 169-175, shoulders 663-666)
+ICON_W = L.ICON_W                          # envelope paper width in the hole when icon = 1 (landscape measured 112)
 SS = 4                                     # hole supersampling
 
 _S = {}
@@ -117,7 +120,7 @@ def _envelope_fallback(w=320):
 
 
 LETTER_LINES = [("i", "Dear Uncle,"), ("r", "What can I cook tonight with eggs and spinach?"), ("i", "Love, Sam")]
-CARD_CENTRE = (1460.0, 541.0)              # paper centre at rest (measured, frame 552)
+CARD_CENTRE = L.CARD_CENTRE                # paper centre at rest (landscape measured, frame 552; reel below-right of the face)
 
 
 def _letter():
@@ -127,12 +130,13 @@ def _letter():
         c = _cards()
         if c is not None:
             try:
-                im = c.LETTER if hasattr(c, "LETTER") else c.card(LETTER_LINES, 420 * F, -2)
+                if L.LETTER["pad"] is not None: im = _letter_px(c)       # reel: px-sized card (REEL_LAYOUT s3)
+                else: im = c.LETTER if hasattr(c, "LETTER") else c.card(LETTER_LINES, L.LETTER["w"], L.LETTER["rot"])
                 if isinstance(im, tuple): im = im[0]
                 im = im.convert("RGBA")
             except Exception:
                 im = None
-        if im is None: im = _letter_fallback()
+        if im is None: im = _letter_px() if L.LETTER["pad"] is not None else _letter_fallback()
         a = np.asarray(im)[..., 3]
         ys, xs = np.where(a > 230)
         _S["letter"] = (im, ((xs.min() + xs.max() + 1) / 2, (ys.min() + ys.max() + 1) / 2))
@@ -149,7 +153,43 @@ def _wrap(dr, text, fnt, width):
     return out
 
 
-def _letter_fallback(w=420 * F, rot=-2, size=30):
+def _letter_px(c=None):
+    """the reel letter card, in output px (L.LETTER: width, text px, padding, line height, paragraph gap), with the same
+    paper as cards.card (cards._sheet_image + rough) when cards is there, else a flat stand-in"""
+    P = L.LETTER
+    w, fs, pad = int(P["w"]), int(P["px"]), P["pad"]
+    lh, gap = P["lh_em"] * fs, P["para_em"] * fs
+    M = 40
+    meas = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    items, y = [], M + pad
+    for k, (st, txt) in enumerate(LETTER_LINES):
+        fnt = font("serif_i" if st == "i" else "serif", fs)
+        if k: y += gap
+        for ln in _wrap(meas, txt, fnt, w - 2 * pad):
+            items.append((fnt, ln, M + pad, y)); y += lh
+    h = int(y - M + pad - 0.3 * fs)                       # 430 x 404 (out/ep4_reel/layout.json 07 letter_paper_wh)
+    im = None
+    if c is not None and hasattr(c, "_sheet_image"):
+        try:
+            arr = c._sheet_image(w, h, M, 0, CARD_PAPER)
+            im = Image.fromarray((np.clip(arr, 0, 1) * 255 + 0.5).astype(np.uint8), "RGBA")
+            im = rough(im, 0.8, 12, seed=101, fine=0.15)
+        except Exception:
+            im = None
+    if im is None:
+        paper = Image.new("RGBA", (w + 2 * M, h + 2 * M), (0, 0, 0, 0))
+        ImageDraw.Draw(paper).rectangle([M, M, M + w, M + h], fill=CARD_PAPER + (255,))
+        paper = rough(paper, 0.8, 12, seed=101, fine=0.15)
+        sh = Image.new("L", paper.size, 0)
+        ImageDraw.Draw(sh).rectangle([M, M + 10, M + w, M + h + 10], fill=int(0.16 * 255))
+        im = Image.new("RGBA", paper.size, INK + (0,)); im.putalpha(sh.filter(ImageFilter.GaussianBlur(14)))
+        im.alpha_composite(paper)
+    d = ImageDraw.Draw(im)
+    for fnt, ln, x, yy in items: d.text((x, yy), ln, font=fnt, fill=INK + (255,))
+    return im.rotate(P["rot"], expand=True, resample=Image.BICUBIC)
+
+
+def _letter_fallback(w=L.LETTER["w"], rot=L.LETTER["rot"], size=30):
     """a stand-in for cards.card(): paper (242,233,217), roughened edge, soft shadow, Source Serif text"""
     fs = int(size * F); m = 40; padx, pady = 66, 62
     lh, gap = 1.42 * fs, 0.62 * fs
@@ -216,7 +256,11 @@ def uncle_frame(lt, tilt, open_frac, icon, extra_lay=None, glint=0.0):
     # body and collar: a sub-pixel breathing shift
     def shifted(lay, box, dy):
         w, h = lay.size
-        out = lay.transform((w, h), Image.AFFINE, (1, 0, 0, 0, 1, -dy), resample=Image.BICUBIC)
+        src = lay
+        if REEL and box[3] >= H:          # reel: the body runs off the bottom; extend its last row so the breath never
+            src = Image.new(lay.mode, (w, h + 6))       # lifts a transparent seam into frame (landscape keeps its 1 px)
+            src.paste(lay, (0, 0)); src.paste(lay.crop((0, h - 1, w, h)).resize((w, 6)), (0, h))
+        out = src.transform((w, h), Image.AFFINE, (1, 0, 0, 0, 1, -dy), resample=Image.BICUBIC)
         return out.convert("RGBA"), box
     body, bbox = shifted(S["body"], S["body_box"], bdy)
     im.alpha_composite(body, (bbox[0], bbox[1]))
@@ -273,13 +317,14 @@ def uncle_frame(lt, tilt, open_frac, icon, extra_lay=None, glint=0.0):
     # a thin dry glint across the glasses lens
     if glint > 0.01:
         lx, ly = fwd(*S["lens"])
-        P = 40
+        P = int(round(40 * FIG_K))
         g = Image.new("L", (2 * P * SS, 2 * P * SS), 0)
         ca, sa = math.cos(math.radians(-50) + th), math.sin(math.radians(-50) + th)
-        gx, gy = P - 5, P - 3
-        L = 11
-        ImageDraw.Draw(g).line([((gx - ca * L) * SS, (gy - sa * L) * SS), ((gx + ca * L) * SS, (gy + sa * L) * SS)],
-                               fill=255, width=int(1.6 * SS))
+        gx, gy = P - 5 * FIG_K, P - 3 * FIG_K
+        gl_len = 11 * FIG_K
+        ImageDraw.Draw(g).line([((gx - ca * gl_len) * SS, (gy - sa * gl_len) * SS),
+                                ((gx + ca * gl_len) * SS, (gy + sa * gl_len) * SS)],
+                               fill=255, width=int(1.6 * FIG_K * SS))
         g = g.resize((2 * P, 2 * P), Image.LANCZOS).filter(ImageFilter.GaussianBlur(0.8))
         g = g.point(lambda v: int(v * min(1.0, glint) * 150 / 255))
         gl = Image.new("RGBA", g.size, (255, 248, 232, 0)); gl.putalpha(g)
@@ -303,7 +348,7 @@ def _back(p, c1=0.6):
     return 1 + c3 * (p - 1) ** 3 + c1 * (p - 1) ** 2
 
 
-CARD_IN, CARD_DUR, CARD_OFF = 1.2, 0.7, 912      # s3: the letter slides in from the right (start, s, px travel)
+CARD_IN, CARD_DUR, CARD_OFF = 1.2, 0.7, L.CARD_OFF   # s3: the letter slides in from the right (start, s, px travel)
 
 
 def letter_layer(lt):
@@ -317,12 +362,13 @@ def letter_layer(lt):
     return lay
 
 
-# (text, size_1280, x_1280, y_1280, alpha) -- the storyboard word cloud (recovered first four + canvas list)
-WORDS = [("spinach", 26, 0, 90, .85), ("eggs", 24, 60, 160, .75), ("tonight", 22, 150, 40, .6),
-         ("omelette", 22, 200, 220, .55), ("Dear Uncle", 20, 290, 120, .45), ("butter", 18, 380, 290, .35),
-         ("Sam", 16, 470, 60, .25), ("fold", 15, 520, 190, .2), ("cook", 13, 610, 260, .12), ("love", 12, 660, 140, .08)]
-WORD_ORIGIN = (790, 145)        # where the cloud's (0, 0) lands (fit to the reference; storyboard origin was (660, 165))
-WORD_EMERGE = (812, 360)        # words leave the face here (text left edge, mid-height)
+# landscape: (text, size_1280, x_1280, y_1280, alpha) -- the storyboard word cloud (recovered first four + canvas list)
+WORDS = L.WORDS
+WORD_ORIGIN = L.WORD_ORIGIN     # where the cloud's (0, 0) lands (fit to the reference; storyboard origin was (660, 165))
+# reel: (text, px, alpha, rest top-left x, y at WORD_REST_AT, drift vx, vy px/s) -- they rise up and slightly right
+WORDS_PX = L.WORDS_PX
+WORD_REST_AT = L.WORD_REST_AT   # absolute time (s) at which a word that has finished emerging sits at its rest position
+WORD_EMERGE = L.WORD_EMERGE     # words leave the face here (text left edge, mid-height)
 WORD_GAP, WORD_TRAVEL, WORD_FADEIN = 0.30, 3.0, 0.4
 WORD_DELAY = 0.05               # words and the icon's exit start together, on the first twos step after FORGET
 _WORD_IMG = {}
@@ -339,6 +385,36 @@ def _word_img(text, px, alpha):
     return _WORD_IMG[k]
 
 
+def _drift(sd):
+    """slow spread once a word is out: a C1 ramp (0 until sd = 0, then sd^2/2, then linear at 1 px per px/s)"""
+    return 0.0 if sd <= 0 else (sd * sd / 2 if sd < 1 else sd - 0.5)
+
+
+def _words_px(tt, t0, fade):
+    """reel word cloud: each word eases out of WORD_EMERGE over WORD_TRAVEL to its rest point, then drifts (vx, vy);
+    the target is offset by the drift it already has at WORD_REST_AT, so finished words sit exactly at rest then"""
+    lay = blank()
+    rest_lt = WORD_REST_AT - TL.T["s5"][0]
+    for i, (text, px, alpha, rx, ry, vx, vy) in enumerate(WORDS_PX):
+        ti = t0 + i * WORD_GAP
+        dt = tt - ti
+        if dt <= 0: continue
+        a = alpha * min(1.0, dt / WORD_FADEIN) * fade
+        if a < 0.004: continue
+        ex, ey = WORD_EMERGE[0], WORD_EMERGE[1] - 0.62 * px
+        d0 = _drift(rest_lt - ti - 1.2)
+        tx, ty = rx - vx * d0, ry - vy * d0
+        e = ease(dt / WORD_TRAVEL)
+        dd = _drift(dt - 1.2)
+        X = ex + (tx - ex) * e + vx * dd
+        Y = ey + (ty - ey) * e + vy * dd
+        img = _word_img(text, px, alpha)
+        if a < 0.999:
+            img = img.copy(); img.putalpha(img.getchannel("A").point(lambda v: int(v * a)))
+        lay.alpha_composite(img, (int(round(X)), int(round(Y))))
+    return lay
+
+
 def words_layer(lt):
     """s5 overlay: the words of the letter drift out of his face from FORGET and fade by "Gone" (on twos)"""
     tt = twos(lt)
@@ -347,6 +423,7 @@ def words_layer(lt):
     fa, fb = TL.FADE_WORDS
     fade = 1 - min(max((tt - fa) / (fb - fa), 0.0), 1.0)
     if fade <= 0: return None
+    if WORDS_PX is not None: return _words_px(tt, t0, fade)
     lay = blank()
     for i, (text, size, x, y, alpha) in enumerate(WORDS):
         ti = t0 + i * WORD_GAP
