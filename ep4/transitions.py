@@ -141,7 +141,7 @@ def rush_resolve(t):
         from .seasky import KD_win, push_box
         x0, y0, s = push_box(t - TILT[1], T["s2"][1] - TILT[1], KD_win, 0.06)
         focus = ((KD_win[0] - x0) * s, (KD_win[1] - y0) * s)       # the window on screen
-        return light_rush(img, 1 + 2.6 * ease_in(q), focus, 18 * q, 0.85 * q ** 1.6, 60 + 900 * q ** 2, RUSH_COL)
+        return light_rush(img, 1 + 2.6 * ease_in(q), focus, 18 * q, 0.85 * q ** 1.3, 60 + 1100 * q ** 2, RUSH_COL)
     r = min(1.0, (t - RESOLVE[0]) / (RESOLVE[1] - RESOLVE[0]))
     img = uncle_at(local("s3", t))
     k = 1 - ease(r)

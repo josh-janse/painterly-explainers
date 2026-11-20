@@ -71,7 +71,10 @@ def scene_night(t):
 # ------------------------------------------------------------------ the dispatcher (§4.10)
 def _scene(mod, fn, label_t, *args, **kw):
     img = call(mod, fn, *args, **kw)
-    return img if img is not None else placeholder(f"{mod}.{fn}{args}", label_t)
+    if img is not None: return img
+    sig = ", ".join(f"{x:.2f}" if isinstance(x, float) else repr(x) for x in args)
+    sig += "".join(f", {k}={v!r}" for k, v in kw.items())
+    return placeholder(f"{mod}.{fn}({sig})", label_t)
 
 
 def _sheet(a, b, p, direction, seed, key, t):
