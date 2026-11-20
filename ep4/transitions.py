@@ -92,8 +92,8 @@ def uncle_at(lt):
 # ------------------------------------------------------------------ w3: window-to-window rush (§4.5)
 RUSH = (T["w3"][0], T["w3"][0] + 0.55 * (T["w3"][1] - T["w3"][0]))     # 17.50 -> 17.885
 RESOLVE = (RUSH[1], RUSH[1] + 0.715)                                    # 17.885 -> 18.60 (_RD, runs into s3)
-RUSH_COL = np.array([252, 226, 162], np.float32) / 255                  # warm window light
-CREAM_COL = np.array([245, 236, 216], np.float32) / 255                 # the uncle's paper, lit
+RUSH_COL = np.array([250, 226, 171], np.float32) / 255                  # warm window light (fitted to v9, 17.71-17.88)
+CREAM_COL = np.array([247, 233, 203], np.float32) / 255                 # the white-out / uncle's paper, lit (v9, 17.92-18.20)
 _GRID = {}
 
 
@@ -127,13 +127,18 @@ def light_rush(img, s, focus, blur, glow, radius, col):
     out = _blur(zoom_at(img, s, focus), blur)
     if glow > 0:
         yy, xx = _grid()
-        g = np.exp(-(((xx - focus[0]) ** 2 + (yy - focus[1]) ** 2) / (2 * radius ** 2)))[..., None] * glow
+        g = np.minimum(np.exp(-(((xx - focus[0]) ** 2 + (yy - focus[1]) ** 2) / (2 * radius ** 2))) * glow, 1.0)[..., None]
         out = out + (col - out) * g
     return np.clip(out, 0, 1)
 
 
 def rush_resolve(t):
-    """17.50 -> 18.60: rush into the lit cottage window, then resolve out of the uncle's head window"""
+    """17.50 -> 18.60: rush into the lit cottage window, white out, then resolve out of the uncle's head window.
+
+    Curves fitted frame by frame to v9 (zoom / blur / glow amount + radius per frame, least squares on the reference):
+    the zoom is a plain q^2 push; the blur stays light until mid-rush; the glow only starts at q ~ 0.33, grows from a
+    tight hot spot on the window and floods the frame by 17.875; the cut to the uncle lands inside the full white-out
+    (17.917 is a near-uniform cream) and the uncle comes out washed and soft, sharp by ~18.33."""
     if t < RUSH[1]:
         from .video import scene_dusk           # lazy: video imports this module
         q = (t - RUSH[0]) / (RUSH[1] - RUSH[0])
@@ -141,12 +146,16 @@ def rush_resolve(t):
         from .seasky import KD_win, push_box
         x0, y0, s = push_box(t - TILT[1], T["s2"][1] - TILT[1], KD_win, 0.06)
         focus = ((KD_win[0] - x0) * s, (KD_win[1] - y0) * s)       # the window on screen
-        return light_rush(img, 1 + 2.6 * ease_in(q), focus, 18 * q, 0.85 * q ** 1.3, 60 + 1100 * q ** 2, RUSH_COL)
-    r = min(1.0, (t - RESOLVE[0]) / (RESOLVE[1] - RESOLVE[0]))
+        glow = min(1.0, 1.75 * max(0.0, q - 0.33))
+        return light_rush(img, 1 + 2.6 * q * q, focus, 16 * q ** 2.4, glow, 150 * 2 ** ((q - 0.56) / 0.11), RUSH_COL)
+    dt = t - RESOLVE[0]
     img = uncle_at(local("s3", t))
-    k = 1 - ease(r)
-    col = CREAM_COL + (RUSH_COL - CREAM_COL) * k ** 3
-    return light_rush(img, 1 + 1.2 * k, WIN_C, 18 * k, 0.85 * k * k, 250 + 1400 * k, col)
+    def fall(L, p): return max(0.0, 1 - dt / L) ** p
+    flash = math.exp(-dt / 0.02)               # first resolve frame: a flat-topped, very soft white-out (no ghost of the head)
+    glow = min(1.0, 1.105 * fall(0.423, 1.2)) + 0.5 * flash      # > 1 = the glow clips flat over the middle of the frame
+    radius = max(150.0, 900 * math.exp(-(dt - 0.073) * 8.6))
+    blur = 18.4 * fall(0.615, 2.25) + 30 * flash
+    return light_rush(img, 1 + 0.825 * fall(0.57, 2.0), WIN_C, blur, glow, radius, CREAM_COL)
 
 
 def in_rush(t): return RUSH[0] <= t < RESOLVE[1]
