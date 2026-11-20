@@ -118,7 +118,9 @@ def living_sea(img, K, t, night=False, on=1.0):
     hzp = int(K["hz"] * H)
     # sky: the cloud layer drifts and reshapes over the still cloudless sky; the land stays put
     rows = np.arange(0, hzp + 2)
-    sky = K["nc"][rows] + cloud_layer(K, rows, t, hzp)
+    # (img minus the plate's own clouds, not K["nc"]: K["nc"] has the window lit, which would switch the light on in
+    #  the sky rows before LIGHT_ON - the v9 reference shows that bug; for the full plates the two are identical)
+    sky = img[rows] - K["cloud"][rows] + cloud_layer(K, rows, t, hzp)
     keep = K["land"][rows][..., None]
     out[rows] = sky * (1 - keep) + img[rows] * keep
     # water: rows sway sideways, more strongly toward the viewer, so strokes and reflections ripple
@@ -269,20 +271,21 @@ def bird_sprite(span, wy):
     cx, cy = w_ / 2, pad + 0.55 * s + abs(wy)
     im = Image.new("RGBA", (w_ * k, h_ * k), (0, 0, 0, 0)); dr = ImageDraw.Draw(im)
     for sg in (-1, 1):
+        # one wing: a crescent around a gently arched centre line, deepest chord near the shoulder, pointed tip
         p0 = (0.0, 0.0)
-        p1 = (sg * 0.28 * s, -0.42 * s - 0.25 * wy)
-        p2 = (sg * 0.62 * s, -0.36 * s - 0.1 * wy)
+        p1 = (sg * 0.30 * s, -0.26 * s - 0.30 * wy)
+        p2 = (sg * 0.66 * s, -0.22 * s - 0.10 * wy)
         p3 = (sg * 1.0 * s, 0.10 * s + wy)
-        n = 28
-        for j in range(n + 1):
-            u = j / n
-            x, y = bez(p0, p1, p2, p3, u)
-            # thick at the shoulder, a slim arm, tapering to a point at the tip
-            th = s * (0.13 * (1 - u) ** 0.7 + 0.025) * (1 + 0.5 * math.exp(-((u - 0.3) / 0.18) ** 2))
-            r_ = th / 2 * k
-            X_, Y_ = (cx + x) * k, (cy + y) * k
-            dr.ellipse([X_ - r_, Y_ - r_, X_ + r_, Y_ + r_], fill=BIRD_RGBA)
-    bw, bh = 0.13 * s * k, 0.09 * s * k
+        n = 40
+        C = np.array([bez(p0, p1, p2, p3, j / n) for j in range(n + 1)])
+        d = np.gradient(C, axis=0); nr = np.stack([-d[:, 1], d[:, 0]], 1); nr /= np.linalg.norm(nr, axis=1, keepdims=True) + 1e-9
+        nr *= np.sign(nr[n // 2, 1]) or 1                                  # normals pointing down (trailing edge)
+        u = np.linspace(0, 1, n + 1)[:, None]
+        th = s * 0.15 * (1 - u) ** 0.6 * (0.6 + 0.4 * np.sin(np.pi * u))
+        top = C - nr * th * 0.35; bot = C + nr * th * 0.65                 # the leading edge stays crisp, chord hangs below
+        poly = [((cx + x) * k, (cy + y) * k) for x, y in np.vstack([top, bot[::-1]])]
+        dr.polygon(poly, fill=BIRD_RGBA)
+    bw, bh = 0.11 * s * k, 0.075 * s * k
     dr.ellipse([cx * k - bw, cy * k - bh * 0.6, cx * k + bw, cy * k + bh * 1.4], fill=BIRD_RGBA)
     im = im.resize((w_, h_), Image.LANCZOS).filter(ImageFilter.GaussianBlur(0.45))
     _BS[key] = (im, cx, cy)
@@ -372,7 +375,10 @@ def env_sprite():
             if fn is not None:
                 try: e = rough(fn(320), 0.6, 10, seed=7, fine=0.15)
                 except Exception as ex: print("[seasky] cards.envelope failed:", ex); e = None
-        _ENV["env"] = (e if e is not None else _fallback_envelope(320)).convert("RGBA")
+        e = (e if e is not None else _fallback_envelope(320)).convert("RGBA")
+        ys, xs = np.nonzero(np.asarray(e.getchannel("A")) > 128)
+        _ENV["env"] = e
+        _ENV["k"] = e.width / max(1, xs.max() - xs.min() + 1)      # sprite width per px of envelope paper (margins)
     return _ENV["env"]
 
 
@@ -399,7 +405,7 @@ def fly(lay, path, u, size0, size1, rot0, rot1, t, dot_col):
         d = _dot(r, dot_col)
         lay.alpha_composite(d, (int(round(x - d.width / 2)), int(round(y - d.height / 2))))
     env = env_sprite()
-    w = size0 + (size1 - size0) * u
+    w = (size0 + (size1 - size0) * u) * _ENV["k"]           # size = width of the envelope paper itself
     h = max(2, int(round(w * env.height / env.width)))
     spr = env.resize((max(2, int(round(w))), h), Image.LANCZOS)
     spr = spr.rotate(rot0 + (rot1 - rot0) * u, expand=True, resample=Image.BICUBIC)
