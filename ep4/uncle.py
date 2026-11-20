@@ -46,7 +46,7 @@ def _crop_layer(im, margin):
 
 
 def _assets():
-    if _S: return _S
+    if "bg" in _S: return _S          # (_S also caches the envelope icon, so test for the plates themselves)
     bg = Image.open(os.path.join(A, "uncle_bg.jpg")).convert("RGB")
     if bg.size != (W, H): bg = bg.resize((W, H), Image.LANCZOS)
     _S["bg"] = bg.convert("RGBA")
