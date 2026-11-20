@@ -263,8 +263,9 @@ def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0
         def rp(px, py):
             dx, dy = px - W0 / 2, py - H0 / 2
             return (W1 / 2 + dx * math.cos(ar) + dy * math.sin(ar), H1 / 2 - dx * math.sin(ar) + dy * math.cos(ar))
-        CARD_CACHE[key] = (out, find, rp)
-    out, find, rp = CARD_CACHE[key]
+        CARD_CACHE[key] = (out, find, rp, (M, int(w), h))
+    out, find, rp, geom = CARD_CACHE[key]
+    if anchors == "geom": return out, rp, geom
     if anchors is None: return out
     res = {}
     for word in anchors:
@@ -274,25 +275,35 @@ def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0
             res[word] = dict(left=rp(x0, ym), right=rp(x1, ym), top=rp((x0 + x1) / 2, yy_ + 0.05 * fs), bottom=rp((x0 + x1) / 2, yy_ + 1.25 * fs))
     return out, res
 
-def tape(w, h, rot, seed):
-    """a strip of paper tape: translucent, torn ends"""
+def _tape_strip(w, h, seed):
+    """unrotated masking-tape strip (m px margin): float rgb 0-255 and alpha 0-1. Crisp long edges with a faint darker
+    line, hand-torn serrated short ends with a lighter, thinner fibre rim, lengthwise fibres and a slight blotchiness."""
     r = np.random.default_rng(500 + seed)
     m = 6; Hh, Ww = h + 2 * m, w + 2 * m
     yy, xx = np.mgrid[0:Hh, 0:Ww].astype(np.float32)
-    def end(n):                                              # a ragged short end: zig-zag tear plus a slight slant
-        z = ndi.gaussian_filter1d(r.standard_normal(n // 2 + 2), 0.6) * 1.8
-        return np.interp(np.arange(n), np.arange(len(z)) * 2, z) + np.linspace(-1, 1, n) * r.uniform(-3, 3)
+    def end(n):                                              # a torn short end: fine serration, a few bigger jags, a slant
+        saw = np.where(np.arange(n // 2 + 2) % 2, 1.0, -1.0) * r.uniform(0.3, 1.4, n // 2 + 2) + r.normal(0, 0.5, n // 2 + 2)
+        jag = ndi.gaussian_filter1d(r.standard_normal(n // 6 + 3), 0.8) * 2.0
+        z = np.interp(np.arange(n), np.arange(len(saw)) * 2, saw) + np.interp(np.arange(n), np.arange(len(jag)) * 6, jag)
+        return z + np.linspace(-1, 1, n) * r.uniform(-4, 4)
     yi = np.clip(yy - m, 0, h - 1).astype(int)
     le, ri = end(h), end(h)
-    d = np.minimum.reduce([xx - (m + 2 + le[yi]), (m + w - 2 + ri[yi]) - xx, yy - m + 0.5, (m + h - 0.5) - yy])
-    a = np.clip(d + 0.5, 0, 1)
+    d_end = np.minimum(xx - (m + 2 + le[yi]), (m + w - 2 + ri[yi]) - xx)
+    d_side = np.minimum(yy - m + 0.5, (m + h - 0.5) - yy)
+    a = np.clip(np.minimum(d_end, d_side) + 0.5, 0, 1)
     fib = ndi.gaussian_filter(r.standard_normal((Hh, Ww)), (0.6, 5.0)); fib /= fib.std() + 1e-6   # faint lengthwise fibres
     blot = ndi.gaussian_filter(r.standard_normal((Hh, Ww)), 6); blot /= blot.std() + 1e-6
+    rim = np.clip(1 - d_end / 2.5, 0, 1)                    # the torn ends: lighter, thinner fibres
+    side = np.clip(1 - np.abs(d_side - 0.8) / 1.0, 0, 1) * (d_end > 1)   # the cut long edges catch a faint dark line
     base = np.array(TAPE[:3], np.float32)
-    shade = (-4.0 + 1.6 * fib + 1.4 * blot)[..., None]                        # measured: tape reads a touch darker than its flat colour
-    rgb = np.clip(base + shade, 0, 255)
-    alpha = a * (TAPE[3] + 6 * blot)
-    im = Image.fromarray(np.dstack([rgb, np.clip(alpha, 0, 255)]).astype(np.uint8), "RGBA")
+    rgb = base + (1.6 * fib + 1.4 * blot)[..., None] + rim[..., None] * np.array([16, 18, 22], np.float32) - side[..., None] * 14
+    alpha = a * (TAPE[3] / 255 + 0.025 * blot + 0.10 * side - 0.22 * rim)
+    return np.clip(rgb, 0, 255), np.clip(alpha, 0, 1)
+
+def tape(w, h, rot, seed):
+    """a strip of masking tape: translucent, torn ends, rotated rot degrees (centre of the strip = centre of the image)"""
+    rgb, a = _tape_strip(w, h, seed)
+    im = Image.fromarray(np.dstack([rgb, a * 255]).astype(np.uint8), "RGBA")
     return im.rotate(rot, expand=True, resample=Image.BICUBIC)
 
 def envelope(w=320):
@@ -370,14 +381,41 @@ ANS2 = "Without eggs? Try spinach and cheese on toast."
 CARDS = TAPES = ANC2 = ANC3 = None
 CARD_HL = {}
 
+# each tape: (position along the card's top edge 0-1, angle relative to the card in degrees, seed). Centred so that
+# ~57 % of its width lies on the card and ~43 % on whatever is behind (backdrop, or the card above).
+TAPE_SPEC = [(0.46, 4.5, 1), (0.55, -5.0, 2), (0.80, 3.5, 3)]     # tape 3 sits right of "three beaten eggs…" so it covers no words
+TAPE_WH = (138, 40)            # px (not x F), a little larger than the v9 120 x 36 so it reads at 1080p
+TAPE_ON = 0.57                 # share of the tape's width on the card it holds
+TAPE_PAD = 30
+
+def _taped(c, args, seed, u, dang):
+    """the tape for one card as an RGBA sprite in the card image's own frame (offset by -TAPE_PAD): drawn on top of the
+    card, straddling its top edge, with a very soft shadow on the side that is off the card only"""
+    _, rp, (M, w, h) = card(*args, size=22, seed=seed, anchors="geom")
+    rot = args[2]; tw, th = TAPE_WH
+    off = (TAPE_ON - 0.5) * th                                     # the strip's centre sits this far inside the top edge
+    cx, cy = rp(M + u * w, M + off)
+    tp = tape(tw, th, rot + dang, seed)
+    P = TAPE_PAD; Wc, Hc = c.width + 2 * P, c.height + 2 * P
+    lay = Image.new("RGBA", (Wc, Hc), (0, 0, 0, 0))
+    lay.alpha_composite(tp, (int(round(cx + P - tp.width / 2)), int(round(cy + P - tp.height / 2))))
+    ta = np.asarray(lay.getchannel("A"), np.float32) / 255
+    ca = np.zeros((Hc, Wc), np.float32); ca[P:P + c.height, P:P + c.width] = np.asarray(c.getchannel("A"), np.float32) / 255
+    paper = np.clip((ca - 0.45) / 0.45, 0, 1)                      # the card's paper, not its drop shadow
+    sh = ndi.shift(ndi.gaussian_filter(np.minimum(ta * 3, 1), 3.0), (1.6, 0.8), order=1) * 0.17 * (1 - paper) * (1 - ta)
+    ink = np.array(INK, np.float32)
+    trgb = np.asarray(lay.convert("RGB"), np.float32)
+    al = ta + sh * (1 - ta)
+    rgb = (trgb * ta[..., None] + ink * (sh * (1 - ta))[..., None]) / np.maximum(al, 1e-6)[..., None]
+    return Image.fromarray(np.dstack([np.clip(rgb, 0, 255), np.clip(al * 255, 0, 255)]).astype(np.uint8), "RGBA")
+
 def _history_assets():
     global CARDS, TAPES, ANC2, ANC3
     if CARDS is None:
         CARDS = [card(*C1_ARGS, size=22, seed=1), card(*C2_ARGS, size=22, seed=2), card(*C3_ARGS, size=22, seed=3)]
         _, ANC2 = card(*C2_ARGS, size=22, seed=2, anchors=["omelette", "spinach"])
         _, ANC3 = card(*C3_ARGS, size=22, seed=3, anchors=["it"])
-        TAPES = [(tape(120, 36, 6, 1), (110 * F + 300, 140 * F - 26)), (tape(120, 36, -8, 2), (150 * F + 360, 300 * F - 26)),
-                 (tape(120, 36, 4, 3), (125 * F + 320, 470 * F - 26))]
+        TAPES = [_taped(c, a, sd, u, da) for c, a, (u, da, sd) in zip(CARDS, (C1_ARGS, C2_ARGS, C3_ARGS), TAPE_SPEC)]
 
 def card_marked(i, p_it, p_om):
     key = (i, round(p_it, 2), round(p_om, 2))
@@ -414,11 +452,15 @@ def scene_history(t, static=False):
         if p <= 0: continue
         cc = c if p >= 1 else c.resize((int(c.width * (1.08 - 0.08 * p)), int(c.height * (1.08 - 0.08 * p))), Image.LANCZOS)
         x = pos[0] - (cc.width - c.width) / 2; y = pos[1] - (cc.height - c.height) / 2 - 60 * (1 - p)
+        tp = TAPES[i]                     # the tape lands with its card: same scale, offset and fade, drawn right after it
         if p < 1:
-            cc = cc.copy(); cc.putalpha(cc.getchannel("A").point(lambda v: int(v * min(1, p * 2))))
+            sx, sy = cc.width / c.width, cc.height / c.height
+            tp = tp.resize((int(round(tp.width * sx)), int(round(tp.height * sy))), Image.LANCZOS)
+            fade = lambda v: int(v * min(1, p * 2))
+            cc = cc.copy(); cc.putalpha(cc.getchannel("A").point(fade)); tp.putalpha(tp.getchannel("A").point(fade))
+        else: sx = sy = 1
         lay.alpha_composite(cc, (int(x), int(y)))
-        tp, tpos = TAPES[i]
-        if static or lt > CARD0 + CARD_GAP * i + 0.5: lay.alpha_composite(tp, (int(tpos[0]), int(tpos[1])))
+        lay.alpha_composite(tp, (int(x) - int(round(TAPE_PAD * sx)), int(y) - int(round(TAPE_PAD * sy))))
     if p_ar > 0:      # from "it" in the new letter, round to the end of "spinach omelette" in his reply
         ink_arrow(lay, arrow_points(), ease_io(p_ar))
     if static or lt > ANS2_DOTS:
