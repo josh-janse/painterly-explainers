@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from .common import (A, W, H, F, ease, ease_io, twos, load, comp, rough, bez, blank,
                      ENV_PAPER, ENV_FLAP, ENV_FOLD, ENV_STAMP)
 from .timeline import *  # noqa: F401,F403  (T, TILT, LIGHT_ON, PARALLAX, FLY_OUT, FLY_HOME, ...)
+from . import layout as L   # per-format positions (EP4_FORMAT): gulls, flight paths
 
 # ------------------------------------------------------------------ plates and masks (§4.1, recovered)
 DUSK, NIGHT = load("dusk.jpg"), load("night.jpg")
@@ -202,6 +203,15 @@ def _build_parallax():
     land = ndi.gaussian_filter(np.asarray(Image.fromarray(src).resize((W, H), Image.BILINEAR), np.float32) / 255, 2)
     wx, wy = KD["win"]; yy0, xx0 = np.mgrid[0:H, 0:W].astype(np.float32)
     land = np.maximum(land, ndi.gaussian_filter(((np.abs(xx0 - wx) < 30) & (yy0 > wy - 38) & (yy0 < wy + 14)).astype(np.float32), 1.2))
+    if L.SMOKE_CURVE:                    # reel: the chimney wisp belongs to the near plane (it is in shot during the tilt)
+        sm = L.SMOKE_CURVE; p0, p1, p2 = (np.array(p, np.float32) for p in sm["pts"])
+        u = np.linspace(0, 1, 60, dtype=np.float32)[:, None]
+        C = (1 - u) ** 2 * p0 + 2 * (1 - u) * u * p1 + u ** 2 * p2
+        x0_, y0_ = int(C[:, 0].min() - 30), int(C[:, 1].min() - 30); x1_, y1_ = int(C[:, 0].max() + 30), int(C[:, 1].max() + 30)
+        gy, gx = yy0[y0_:y1_, x0_:x1_], xx0[y0_:y1_, x0_:x1_]
+        d = np.min([np.hypot(gx - cx_, gy - cy_) for cx_, cy_ in C], axis=0)
+        tube = np.zeros_like(land); tube[y0_:y1_, x0_:x1_] = np.clip((sm["half_w"] + 0.5 - d) / 1.0, 0, 1)
+        land = np.maximum(land, ndi.gaussian_filter(tube, 3.0))
     del yy0, xx0
     landD = ndi.gaussian_filter(ndi.grey_dilation((land > 0.02).astype(np.float32), size=(11, 11)), 1.5)
     # sky behind the hill: a smooth fill grown in from the surrounding sky (normalised convolution at a few scales),
@@ -254,7 +264,7 @@ def parallax(base, dy):
 
 
 # ------------------------------------------------------------------ painted gulls (§4.4.2)
-BIRDS = [(380, 0.17, 40, 0.0, 17), (560, 0.21, 34, 1.3, 14), (470, 0.13, 46, 2.1, 19)]
+BIRDS = L.BIRDS                      # (x0 source px, y frac of H, px/s, phase, half-span px)
 BIRD_RGBA = (70, 62, 80, 218)
 _BS = {}
 
@@ -338,8 +348,10 @@ class Path:
 
 # reconstructed from the reference envelope positions (least-squares fit through the measured centres, with
 # u = the recovered easing; residuals < 4 px). The end that touches the window is the plate's window centre.
-PATH_OUT = Path([(-182, 1154), (502, 728), (1097, 408), KD_win], spacing=(40, 24), radius=(1.7, 3.6))
-PATH_HOME = Path([KN_win, (1198, 508), (700, 765), (559, 859)], spacing=(20, 17), radius=(1.5, 3.4))
+# (reel: refitted for the portrait frame, REEL_LAYOUT §2: in from off the left edge above the caption zone, and home
+#  swooping left then low-centre toward the viewer)
+PATH_OUT = Path(list(L.PATH_OUT) + [KD_win], **L.PATH_OUT_TRAIL)
+PATH_HOME = Path([KN_win] + list(L.PATH_HOME), **L.PATH_HOME_TRAIL)
 
 _ENV = {}
 

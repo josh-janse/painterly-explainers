@@ -6,8 +6,10 @@
     scene_history(t, static=False) -> f32      s7, cream: three taped letters, it -> omelette annotation, the new reply
     envelope(w), ENV, tape(w, h, rot, seed)    art other modules use
 
-All layouts are in 1280-space numbers times F (= output px). Overlays step on twos (§1.3): every scene samples its
-local clock through twos(). Edge roughness uses the softened v9 amounts (§4.8.1).
+Positions, sizes and fonts come from the per-format tables in ep4/layout.py (`L.TITLE`, `L.S4`, `L.S6`, `L.S7`,
+`L.LETTER`, `L.CARD_TYPE`): the landscape values are the original 1280-space numbers times F, verbatim (the landscape
+render is pixel-identical); the reel values are output px from docs/REEL_LAYOUT.md. Overlays step on twos (§1.3): every
+scene samples its local clock through twos(). Edge roughness uses the softened v9 amounts (§4.8.1).
 """
 import math
 import re
@@ -16,7 +18,8 @@ import numpy as np
 import scipy.ndimage as ndi
 from PIL import Image, ImageDraw
 
-from ep4.common import (W, H, F, INK, HL, TAG_LIGHT, CARD_PAPER, CARD_LABEL, TAPE, ENV_PAPER, ENV_FLAP, ENV_FOLD,
+from ep4 import layout as L
+from ep4.common import (W, H, F, REEL, INK, HL, TAG_LIGHT, CARD_PAPER, CARD_LABEL, TAPE, ENV_PAPER, ENV_FLAP, ENV_FOLD,
                         ENV_STAMP, ease, ease_io, twos, load, font, comp, blank, rough, tracked, bez)
 from ep4.timeline import (REPLY_TYPE, Q2_TYPE, ANS_DOTS, ANS_TYPE, IT_SWEEP, CARD0, CARD_GAP, ANS2_DOTS, ANS2_TYPE,
                           ANNOT)
@@ -50,15 +53,43 @@ def tag(lines, pos, anchor="tl"):
         y += bh + 10 * F
     return lay
 
+def tag_block(lines, px, pos, pad, gap, track_em, fg, bg):
+    """several mono lines in ONE boxed tag (the reel title), top-left at pos; px = output px, pad = (x, y) px, gap =
+    extra px between lines (line height 1.25 em). Returns the RGBA layer and the y (frame px) where each line after the
+    first begins (half-way through the gap above it), for per-line timing."""
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0)); dr = ImageDraw.Draw(lay)
+    fnt = font("mono", px); tr = px * track_em; lh = px * 1.25
+    tw = max(sum(dr.textlength(c, font=fnt) + tr for c in s) - tr for s in lines)
+    padx, pady = pad
+    bw, bh = tw + 2 * padx, len(lines) * lh + (len(lines) - 1) * gap + 2 * pady
+    x, y = pos
+    key = (int(bw), int(bh), tuple(bg))
+    if key not in TAGC:
+        m = 8; bi = Image.new("RGBA", (int(bw) + 2 * m, int(bh) + 2 * m), (0, 0, 0, 0))
+        ImageDraw.Draw(bi).rectangle([m, m, m + bw, m + bh], fill=tuple(bg))
+        TAGC[key] = rough(bi, 0.6, 10, seed=31 + len(TAGC), fine=0.1)
+    lay.alpha_composite(TAGC[key], (int(x) - 8, int(y) - 8))
+    for i, s in enumerate(lines):
+        tracked(dr, (x + padx, y + pady + i * (lh + gap) + 1), s, fnt, fg, tr)
+    splits = [int(round(y + pady + i * (lh + gap) - gap / 2)) for i in range(1, len(lines))]
+    return lay, splits
+
 TITLE_TEXT = "THE UNCLE WHO ONLY READS LETTERS"
 TITLE_LAY = None
 _TITLE_BOX = None
+_TITLE_SPLITS = []
 def title_reveal(lt, dur):
     """the title folds in: the tag grows from its left edge in stepped, ragged jumps (on twos); on the way out it is
-    wiped away left to right the same way. One tag only (owner change 2: no "EPISODE 4")."""
-    global TITLE_LAY, _TITLE_BOX
+    wiped away left to right the same way. One tag only (owner change 2: no "EPISODE 4"). Reel: one two-line tag,
+    the second line's fold-in lagging L.TITLE["line_delay"]; the wipe-out takes both lines together."""
+    global TITLE_LAY, _TITLE_BOX, _TITLE_SPLITS
+    TI = L.TITLE
     if TITLE_LAY is None:
-        TITLE_LAY = tag([(TITLE_TEXT, 22, INK, TAG_LIGHT)], (64 * F, H - 64 * F), "bl")
+        if len(TI["lines"]) == 1:
+            TITLE_LAY = tag([(TI["lines"][0], TI["px"] / F, TI["fg"], TI["bg"])], TI["pos"], TI["anchor"])
+        else:
+            TITLE_LAY, _TITLE_SPLITS = tag_block(TI["lines"], TI["px"], TI["pos"], TI["pad"], TI["line_gap"],
+                                                 TI["track_em"], TI["fg"], TI["bg"])
         a = np.asarray(TITLE_LAY.getchannel("A"))
         ys, xs = np.nonzero(a > 0); _TITLE_BOX = (xs.min(), xs.max() + 1, ys.min(), ys.max() + 1)
     x0, x1, y0, y1 = _TITLE_BOX
@@ -68,6 +99,9 @@ def title_reveal(lt, dur):
     band = np.repeat(r.uniform(-1, 1, (y1 - y0) // 5 + 2), 5)[: y1 - y0] * 5 * F   # ragged leading edge, re-cut every frame
     p_in = ease(lt / 0.42); p_out = ease((lt - (dur - 0.42)) / 0.36)
     edge_in = x0 - 12 + p_in * (span + 12) + band * (p_in < 1)
+    for k, ys_ in enumerate(_TITLE_SPLITS):                      # later lines fold in a beat behind
+        p2 = ease((lt - TI["line_delay"] * (k + 1)) / 0.42); j = ys_ - y0
+        edge_in[j:] = x0 - 12 + p2 * (span + 12) + band[j:] * (p2 < 1)
     edge_out = x0 - 12 + p_out * (span + 12) + band * (0 < p_out < 1)
     cols = np.arange(x0, x1)[None, :]
     m = ((cols < edge_in[:, None]) & (cols >= edge_out[:, None])).astype(np.float32)
@@ -84,7 +118,7 @@ def wrap(dr, text, fnt, width):
         else: lines.append(cur); cur = w_
     lines.append(cur); return lines
 
-def text_block(lay, xy, text, fnt, width, lh, fill=INK, nchars=None, cursor=False):
+def text_block(lay, xy, text, fnt, width, lh, fill=INK, nchars=None, cursor=False, cur=(6 * F, 9 * F)):
     dr = ImageDraw.Draw(lay)
     lines = wrap(dr, text, fnt, width)
     shown = len(text) if nchars is None else nchars
@@ -99,37 +133,49 @@ def text_block(lay, xy, text, fnt, width, lh, fill=INK, nchars=None, cursor=Fals
         y += lh
     if cursor:
         cx, cy = last
-        dr.rectangle([cx + 6 * F, cy + 0.12 * lh, cx + 9 * F, cy + 0.88 * lh], fill=fill)
+        dr.rectangle([cx + cur[0], cy + 0.12 * lh, cx + cur[1], cy + 0.88 * lh], fill=fill)     # cur = (gap, gap + width)
     return lines
 
 PBC = {}
-def prompt_box(lay, xy, w, text, size, highlight=None, nchars=None):
+def prompt_geom(text, w, c):
+    """(font, wrapped lines, line height, box height) of the prompt box for text in a box w px wide; c = L.S4 / L.S6"""
+    fnt = font("sans", c["box_px"])
+    lines = wrap(ImageDraw.Draw(Image.new("RGBA", (8, 8))), text, fnt, w - 2 * c["box_pad"][0])
+    lh = c["box_px"] * c["box_lh_em"]
+    return fnt, lines, lh, len(lines) * lh + 2 * c["box_pad"][1] - c["box_trim_em"] * c["box_px"]
+
+def prompt_box(lay, xy, w, text, c, highlight=None, nchars=None):
     """the chat prompt box: a hand-wavy rounded outline (cached, roughened) with text typed into it. Its height comes
-    from the full text so it doesn't grow while typing. highlight = (word, p): a marker sweep behind the word."""
-    dr = ImageDraw.Draw(lay); fnt = font("sans", size * F)
-    lines = wrap(dr, text, fnt, w - 64 * F)
-    lh = size * F * 1.4
-    hgt = len(lines) * lh + 52 * F
+    from the full text so it doesn't grow while typing. highlight = (word, p): a marker sweep behind the word.
+    c = the scene's layout table (L.S4 / L.S6): font px, padding, radius, outline, highlight padding."""
+    dr = ImageDraw.Draw(lay); fnt, lines, lh, hgt = prompt_geom(text, w, c)
+    px = c["box_px"]
     x, y = xy
     key = (int(w), int(hgt))
     if key not in PBC:
         m = 16; bi = Image.new("RGBA", (int(w) + 2 * m, int(hgt) + 2 * m), (0, 0, 0, 0))
-        ImageDraw.Draw(bi).rounded_rectangle([m, m, m + w, m + hgt], radius=18 * F, outline=INK + (255,), width=int(2 * F))
+        ImageDraw.Draw(bi).rounded_rectangle([m, m, m + w, m + hgt], radius=c["box_radius"], outline=INK + (255,), width=c["box_outline"])
         PBC[key] = rough(bi, 0.55, 14, seed=61 + len(PBC), fine=0.05)          # v8 softened (v7: 0.9, fine 0.1)
     lay.alpha_composite(PBC[key], (int(x) - 16, int(y) - 16))
-    tx, ty = x + 32 * F, y + 26 * F
+    tx, ty = x + c["box_pad"][0], y + c["box_pad"][1]
     if highlight is not None and highlight[1] > 0:
-        word, p = highlight; padl, padr = 5 * F, 5.5 * F
+        word, p = highlight; padl, padr = c.get("hl_pad", (5 * F, 5.5 * F))
         for i, ln in enumerate(lines):
             mt = re.search(r"\b%s\b" % re.escape(word), ln)
             if mt:
                 left = tx + dr.textlength(ln[:mt.start()], font=fnt) - padl
                 wd = dr.textlength(mt.group(0), font=fnt) + padl + padr
-                top = ty + i * lh + 0.02 * size * F
-                dr.rounded_rectangle([left, top, left + max(2, min(1, p) * wd), top + 1.28 * size * F], radius=min(3 * F, min(1, p) * wd / 2), fill=HL + (255,))
+                top = ty + i * lh + 0.02 * px
+                dr.rounded_rectangle([left, top, left + max(2, min(1, p) * wd), top + c.get("hl_h_em", 1.28) * px], radius=min(3 * F, min(1, p) * wd / 2), fill=HL + (255,))
                 break
-    text_block(lay, (tx, ty), text, fnt, w - 64 * F, lh, nchars=nchars)
+    text_block(lay, (tx, ty), text, fnt, w - 2 * c["box_pad"][0], lh, nchars=nchars)
     return (x, y, x + w, y + hgt)
+
+def _group_y(c, text, w, gap, n_after, after_lh, after_px):
+    """top of the prompt box: the table's box y, or (reel) the box + answer group centred on c["group_cy"]"""
+    if c["group_cy"] is None: return c["box_xy"][1]
+    hgt = prompt_geom(text, w, c)[3]
+    return int(c["group_cy"] - (hgt + gap + (n_after - 1) * after_lh + after_px * 1.2) / 2)
 
 
 # ------------------------------------------------------------------ s4 and s6 (§4.7.2, §4.7.3)
@@ -140,17 +186,20 @@ REPLY_DOTS = 0.4          # measured: the bold "..." shows from 0.4 s until the 
 def scene_reply(lt, static=False):
     """s4 on the yellow sheet. static=True: everything typed, cursor showing (the outgoing frame of w5)."""
     lt = twos(lt)
-    lay = blank()
-    hb = prompt_box(lay, (240 * F, 150 * F), 800 * F, LETTER1, 28)
-    org = (244 * F, hb[3] + 40 * F); fnt = font("serif_b", 34 * F); lh = 48 * F      # measured: 72 px between the reply's lines
+    lay = blank(); c = L.S4
+    fnt = font("serif_b", c["reply_px"]); lh = c["reply_lh"]; mw = c["reply_measure"]   # landscape measured: 72 px between the reply's lines
+    nrep = len(wrap(ImageDraw.Draw(lay), REPLY, fnt, mw))
+    y0 = _group_y(c, LETTER1, c["box_w"], c["reply_gap"], nrep, lh, c["reply_px"])
+    hb = prompt_box(lay, (c["box_xy"][0], y0), c["box_w"], LETTER1, c)
+    org = (c["reply_dx"], hb[3] + c["reply_gap"])
     if static:
-        text_block(lay, org, REPLY, fnt, 800 * F, lh, cursor=True)
+        text_block(lay, org, REPLY, fnt, mw, lh, cursor=True, cur=c["cursor"])
     elif lt >= REPLY_TYPE[0] or lt > REPLY_DOTS:
         m = int((lt - REPLY_TYPE[0]) * REPLY_TYPE[1])
         if m <= 0:
-            text_block(lay, org, "…", fnt, 800 * F, lh)
+            text_block(lay, org, "…", fnt, mw, lh)
         else:   # the cursor blinks at 1 Hz on the scene clock (measured: on for the first half of each second)
-            text_block(lay, org, REPLY, fnt, 800 * F, lh, nchars=min(m, len(REPLY)), cursor=int(lt * 2) % 2 == 0)
+            text_block(lay, org, REPLY, fnt, mw, lh, nchars=min(m, len(REPLY)), cursor=int(lt * 2) % 2 == 0, cur=c["cursor"])
     return _f32(comp(load("paper_yellow.jpg"), lay))
 
 Q2 = "Thanks! Can you make it without eggs?"
@@ -159,15 +208,18 @@ ANS = "Make what, dear?"
 def scene_second(lt, static=False):
     """s6 on the pink sheet. static=True = everything complete (the outgoing frame of w7)."""
     lt = twos(lt)
-    lay = blank()
+    lay = blank(); c = L.S6
     n = len(Q2) if static else max(0, int((lt - Q2_TYPE[0]) * Q2_TYPE[1]))
     p_it = 1 if static else ease((lt - IT_SWEEP) / 0.4)
-    hb = prompt_box(lay, (240 * F, 190 * F), 800 * F, Q2, 30, highlight=("it", p_it), nchars=n)
-    org = (244 * F, hb[3] + 44 * F); fnt = font("serif_b", 40 * F); lh = 40 * F * 1.35
+    fnt = font("serif_b", c["ans_px"]); lh = c["ans_lh"]; mw = c["ans_measure"]
+    nans = len(wrap(ImageDraw.Draw(lay), ANS, fnt, mw))
+    y0 = _group_y(c, Q2, c["box_w"], c["ans_gap"], nans, lh, c["ans_px"])
+    hb = prompt_box(lay, (c["box_xy"][0], y0), c["box_w"], Q2, c, highlight=("it", p_it), nchars=n)
+    org = (c["ans_dx"], hb[3] + c["ans_gap"])
     if static or lt > ANS_DOTS:
         m = len(ANS) if static else int((lt - ANS_TYPE[0]) * ANS_TYPE[1])
-        if not static and lt < ANS_TYPE[0]: text_block(lay, org, "…", fnt, 800 * F, lh)
-        elif m > 0: text_block(lay, org, ANS, fnt, 800 * F, lh, nchars=m)
+        if not static and lt < ANS_TYPE[0]: text_block(lay, org, "…", fnt, mw, lh)
+        elif m > 0: text_block(lay, org, ANS, fnt, mw, lh, nchars=m)
     return _f32(comp(load("paper_pink.jpg"), lay))
 
 
@@ -217,16 +269,26 @@ def _marker(dr, x0, x1, top, bot, p, seed):
     dr.polygon(pts, fill=HL + (255,))
 
 CARD_CACHE = {}
-def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0, anchors=None):
+def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0, anchors=None, spec=None):
     """a letter card: lays out first, draws marker sweeps {phrase: progress} via regex \\b...\\b, roughens, draws text,
     rotates, and optionally returns word anchors (left, right, top, bottom) mapped through the rotation.
-    anchors: list of words whose (left, right, mid-y) positions in the rotated image are returned as well."""
-    key = (repr(text_lines), int(w), rot, label, bold, size, repr(sorted((marks or {}).items())), seed)
-    fs = size * F
+    anchors: list of words whose (left, right, mid-y) positions in the rotated image are returned as well.
+    spec = None: the landscape card, sizes from `size` (1280-space) times F. spec = dict(px, pad, lh_em, para_em,
+    label_px, label_track_em, label_gap, trim_em): every size in output px (the reel; see card_spec())."""
+    key = (repr(text_lines), int(w), rot, label, bold, size, repr(sorted((marks or {}).items())), seed, repr(spec))
+    fs = size * F if spec is None else spec["px"]
     if key not in CARD_CACHE:
-        M = 40; padx, pady = 42 * F, 42 * F                 # measured against the reference: text inset 63 px, label 63 px down
-        lh, pgap = 1.48 * fs, 0.62 * fs
-        lab_f = font("mono", 13 * F); lab_tr = 13 * F * 0.14; lab_h = 13 * F * 1.25 + 5.5 * F
+        M = 40
+        if spec is None:
+            padx, pady = 42 * F, 42 * F                     # measured against the reference: text inset 63 px, label 63 px down
+            lh, pgap = 1.48 * fs, 0.62 * fs
+            lab_f = font("mono", 13 * F); lab_tr = 13 * F * 0.14; lab_h = 13 * F * 1.25 + 5.5 * F
+            trim = 0.0
+        else:
+            padx = pady = spec["pad"]
+            lh, pgap = spec["lh_em"] * fs, spec["para_em"] * fs
+            lp = spec["label_px"]; lab_f = font("mono", lp); lab_tr = lp * spec["label_track_em"]; lab_h = lp * 1.25 + spec["label_gap"]
+            trim = spec["trim_em"] * fs
         tw = w - 2 * padx
         meas = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
         items = []                                           # (font, text, x, y) per laid-out line
@@ -237,7 +299,7 @@ def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0
             if k: y += pgap
             for ln in wrap(meas, tx, fnt, tw):
                 items.append((fnt, ln, M + padx, y)); y += lh
-        h = int(round(y - M + pady - 1))                     # measured paper heights: 252 / 321 / 204 px
+        h = int(round(y - M + pady - 1 - trim))              # landscape measured paper heights: 252 / 321 / 204 px
         def find(word):
             for fnt, ln, x, yy_ in items:
                 mt = re.search(r"\b%s\b" % re.escape(word), ln)
@@ -274,6 +336,23 @@ def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0
             x0, x1, yy_ = f_; ym = yy_ + 0.62 * fs
             res[word] = dict(left=rp(x0, ym), right=rp(x1, ym), top=rp((x0 + x1) / 2, yy_ + 0.05 * fs), bottom=rp((x0 + x1) / 2, yy_ + 1.25 * fs))
     return out, res
+
+def card_spec(t):
+    """the output-px card spec for a reel layout table (L.S7 or L.LETTER); None in landscape (cards use size * F)"""
+    if t.get("pad") is None: return None
+    ct, s7 = L.CARD_TYPE, L.S7
+    return dict(px=t.get("px", t.get("text_px")), pad=t["pad"], lh_em=t["lh_em"], para_em=t["para_em"],
+                label_px=s7["label_px"], label_track_em=s7["label_track_em"], label_gap=ct["label_gap"], trim_em=ct["trim_em"])
+
+LETTER_LINES = [("i", "Dear Uncle,"), ("r", "What can I cook tonight with eggs and spinach?"), ("i", "Love, Sam")]
+def letter_card(lines=LETTER_LINES, seed=0):
+    """Sam's letter for s3 (ep4/uncle.py) from L.LETTER; landscape = card(lines, 420 * F, -2) exactly"""
+    t = L.LETTER
+    return card(lines, t["w"], t["rot"], size=t["size_arg"] or 30, seed=seed, spec=card_spec(t))
+
+def __getattr__(name):              # cards.LETTER, built on first use (ep4/uncle.py looks for it)
+    if name == "LETTER": return letter_card()
+    raise AttributeError(name)
 
 def _tape_strip(w, h, seed):
     """unrotated masking-tape strip (m px margin): float rgb 0-255 and alpha 0-1. Crisp long edges with a faint darker
@@ -336,7 +415,7 @@ ENV = rough(envelope(320), 0.6, 10, seed=7, fine=0.15)
 
 
 # ------------------------------------------------------------------ the ink arrow (§4.8.5, recovered)
-def ink_arrow(lay, pts, prog, seed=5, width=3.6):
+def ink_arrow(lay, pts, prog, seed=5, width=3.6, head=17 * F):
     """a hand-drawn ink arrow along a curve, drawn on progressively; head appears when the line arrives"""
     if prog <= 0: return
     r = np.random.default_rng(seed); n = 90
@@ -368,7 +447,7 @@ def ink_arrow(lay, pts, prog, seed=5, width=3.6):
         tip = np.array(Q[-1]); back = np.array(Q[-6]); v = (tip - back) / (np.linalg.norm(tip - back) + 1e-6)
         for ang in (0.5, -0.5):
             c_, s_ = math.cos(ang), math.sin(ang); wv = np.array([v[0] * c_ - v[1] * s_, v[0] * s_ + v[1] * c_])
-            dr.line([tuple(tip), tuple(tip - wv * 17 * F * k)], fill=INK + (235,), width=int(width * k))
+            dr.line([tuple(tip), tuple(tip - wv * head * k)], fill=INK + (235,), width=int(width * k))
     lay.alpha_composite(im.resize((int(x1 - x0), int(y1 - y0)), Image.LANCZOS), (int(x0), int(y0)))
 
 

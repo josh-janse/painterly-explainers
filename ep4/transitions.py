@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 
 from .common import W, H, ease, ease_io, ease_in, load, load_rgba, to_pil, to_f32, font
 from .timeline import T, END, TILT, local
+from . import layout as L
 
 # ------------------------------------------------------------------ lazy hooks + placeholders
 _OPT = {}
@@ -61,8 +62,8 @@ def placeholder(label, t, under=None):
 
 
 # ------------------------------------------------------------------ uncle frame for the resolve
-WIN_C = (0.27975 * W, 0.2924 * H)
-WIN_R = 62 * 1.5
+WIN_C = L.WIN_C                 # the hole in the uncle's head (same values as ep4.uncle)
+WIN_R = L.WIN_R
 _UF = {}
 
 
@@ -144,7 +145,7 @@ def rush_resolve(t):
         q = (t - RUSH[0]) / (RUSH[1] - RUSH[0])
         img = scene_dusk(t)
         from .seasky import KD_win, push_box
-        x0, y0, s = push_box(t - TILT[1], T["s2"][1] - TILT[1], KD_win, 0.06)
+        x0, y0, s = push_box(t - TILT[1], T["s2"][1] - TILT[1], KD_win, L.PUSH_S2)
         focus = ((KD_win[0] - x0) * s, (KD_win[1] - y0) * s)       # the window on screen
         glow = min(1.0, 1.75 * max(0.0, q - 0.33))
         return light_rush(img, 1 + 2.6 * q * q, focus, 16 * q ** 2.4, glow, 150 * 2 ** ((q - 0.56) / 0.11), RUSH_COL)
