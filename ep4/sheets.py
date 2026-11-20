@@ -22,8 +22,9 @@ def torn_profile(n, seed):
         def band(sigma, amp):
             f = ndi.gaussian_filter1d(r.standard_normal(n + 64), sigma, mode="wrap")[32:-32]
             return f / (f.std() + 1e-6) * amp
-        jag = band(1.2, 1.6) + np.abs(band(0.8, 1.4)) * np.sign(band(6, 1.0))     # 3-8 px teeth, some pointed
-        prof = band(60, 2.6) + band(14, 1.6) + jag
+        teeth = band(2.6, 2.4)                                                    # rounded teeth ~8-14 px apart (measured w7)
+        jag = teeth + np.maximum(teeth, 0) * 0.5 + band(0.7, 0.6)                 # tips a little sharper, a fine fibre fuzz
+        prof = band(60, 2.6) + band(16, 1.4) + jag
         lip = np.clip(0.55 + band(4, 0.35), 0.1, 1.0)                           # the lip comes and goes
         _EDGES[k] = (prof.astype(np.float32), ndi.gaussian_filter1d(prof, 6).astype(np.float32), lip.astype(np.float32))
     return _EDGES[k]

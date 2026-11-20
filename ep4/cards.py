@@ -119,14 +119,14 @@ def prompt_box(lay, xy, w, text, size, highlight=None, nchars=None):
     lay.alpha_composite(PBC[key], (int(x) - 16, int(y) - 16))
     tx, ty = x + 32 * F, y + 26 * F
     if highlight is not None and highlight[1] > 0:
-        word, p = highlight; pad = 4 * F; used = 0
+        word, p = highlight; padl, padr = 5 * F, 5.5 * F
         for i, ln in enumerate(lines):
             mt = re.search(r"\b%s\b" % re.escape(word), ln)
             if mt:
-                left = tx + dr.textlength(ln[:mt.start()], font=fnt) - pad
-                wd = dr.textlength(mt.group(0), font=fnt) + 2 * pad
-                top = ty + i * lh + 0.04 * size * F
-                dr.rectangle([left, top, left + min(1, p) * wd, top + 1.27 * size * F], fill=HL + (255,))
+                left = tx + dr.textlength(ln[:mt.start()], font=fnt) - padl
+                wd = dr.textlength(mt.group(0), font=fnt) + padl + padr
+                top = ty + i * lh + 0.02 * size * F
+                dr.rounded_rectangle([left, top, left + max(2, min(1, p) * wd), top + 1.28 * size * F], radius=min(3 * F, min(1, p) * wd / 2), fill=HL + (255,))
                 break
     text_block(lay, (tx, ty), text, fnt, w - 64 * F, lh, nchars=nchars)
     return (x, y, x + w, y + hgt)
@@ -142,7 +142,7 @@ def scene_reply(lt, static=False):
     lt = twos(lt)
     lay = blank()
     hb = prompt_box(lay, (240 * F, 150 * F), 800 * F, LETTER1, 28)
-    org = (244 * F, hb[3] + 40 * F); fnt = font("serif_b", 34 * F); lh = 34 * F * 1.35
+    org = (244 * F, hb[3] + 40 * F); fnt = font("serif_b", 34 * F); lh = 48 * F      # measured: 72 px between the reply's lines
     if static:
         text_block(lay, org, REPLY, fnt, 800 * F, lh, cursor=True)
     elif lt >= REPLY_TYPE[0] or lt > REPLY_DOTS:
@@ -224,9 +224,9 @@ def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0
     key = (repr(text_lines), int(w), rot, label, bold, size, repr(sorted((marks or {}).items())), seed)
     fs = size * F
     if key not in CARD_CACHE:
-        M = 40; padx, pady = 44 * F, 40 * F
-        lh, pgap = 1.42 * fs, 0.62 * fs
-        lab_f = font("mono", 13 * F); lab_tr = 13 * F * 0.14; lab_h = 13 * F * 1.25 + 10 * F
+        M = 40; padx, pady = 42 * F, 42 * F                 # measured against the reference: text inset 63 px, label 63 px down
+        lh, pgap = 1.48 * fs, 0.62 * fs
+        lab_f = font("mono", 13 * F); lab_tr = 13 * F * 0.14; lab_h = 13 * F * 1.25 + 5.5 * F
         tw = w - 2 * padx
         meas = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
         items = []                                           # (font, text, x, y) per laid-out line
@@ -237,7 +237,7 @@ def card(text_lines, w, rot, label=None, bold=False, size=30, marks=None, seed=0
             if k: y += pgap
             for ln in wrap(meas, tx, fnt, tw):
                 items.append((fnt, ln, M + padx, y)); y += lh
-        h = int(round(y - M + pady - 2))                     # measured paper heights: 252 / 321 / 204 px
+        h = int(round(y - M + pady - 1))                     # measured paper heights: 252 / 321 / 204 px
         def find(word):
             for fnt, ln, x, yy_ in items:
                 mt = re.search(r"\b%s\b" % re.escape(word), ln)
@@ -402,9 +402,11 @@ def scene_history(t, static=False):
     _history_assets()
     lt = twos(t)
     lay = blank()
-    p_it = 1 if static else ease((lt - ANNOT[0]) / 0.45)
+    # sweep lengths measured from the reference (the recovered code says 0.45 / 0.5 s, but the v9 render sweeps "it" in
+    # two steps and "spinach omelette" in three: 0.79, 1.0 and 0.47, 0.91, 0.99 of the width per step)
+    p_it = 1 if static else ease((lt - ANNOT[0]) / 0.17)
     p_ar = 1 if static else (lt - ANNOT[1]) / 0.65
-    p_om = 1 if static else ease((lt - ANNOT[2]) / 0.5)
+    p_om = 1 if static else ease((lt - ANNOT[2]) / 0.18)
     for i, (c, pos) in enumerate(zip(CARDS, CARD_POS)):
         if i == 1 and p_om > 0: c = card_marked(1, 0, p_om)
         if i == 2 and p_it > 0: c = card_marked(2, p_it, 0)
