@@ -93,6 +93,11 @@ LANDSCAPE = dict(
 
     # ---- added by ep4/seasky.py ----
     SMOKE_CURVE=None,                            # reel only: the chimney wisp rides the near plane in the s1 parallax
+
+    # ---- added by ep4/cards.py ----
+    # card() in output px (reel only; landscape cards keep size * F): gap under the mono label, paper-height trim (em),
+    # and the x of the s7 reply (landscape: S7["ans2_xy"])
+    CARD_TYPE=dict(label_gap=5.5 * F, trim_em=0.0, ans2_x=None),
 )
 
 
@@ -162,6 +167,9 @@ REEL = dict(
     # chimney wisp as painted on the reel plate (quadratic Bezier p0 p1 p2 px, tube half-width px): in the 9:16 tilt the
     # cottage is in shot while the near plane still leads, so the wisp must move with the chimney, not with the sky
     SMOKE_CURVE=dict(pts=[(689.5, 942.0), (661.9, 903.1), (585.8, 883.7)], half_w=9.0),
+
+    # ---- added by ep4/cards.py ----
+    CARD_TYPE=dict(label_gap=12, trim_em=0.3, ans2_x=104),          # as scripts/reel_blockouts.py card_img(); reply at x 104
 )
 
 

@@ -6,13 +6,20 @@ Rows: our still (left) | reference frame (right) at the SPEC §8 timestamps for 
 w4-w7, then 3x nearest-neighbour crops (ours above the reference) of a rough card edge, the arrow and the highlight.
 The uncle frames under the wipes are stood in by the uncle plate (out/ep4/uncle.jpg); the title is laid on the dusk
 plate (the real s1 frame has the camera move). --clip also writes out/ep4/check_s7_annot.mp4 (56.5-61.0 s).
+
+    EP4_FORMAT=reel python3 -m ep4.test_cards            -> out/ep4_reel/check_cards.jpg
+
+Reel (docs/REEL_LAYOUT.md): the real frames from ep4.video at the card/title/wipe moments, with the safe box (green),
+the 3:4 grid crop (orange) and the button column (red) drawn on, each beside its blockout (out/ep4_reel/blockouts/),
+then 1:1 crops of the smallest text (title tag, s4 reply, s6 highlight, s7 label + tape, arrow at the right edge).
+Every text box is also checked against the safe box and the arrow against x 926 (printed).
 """
 import os, subprocess, sys, time
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-from ep4.common import A, W, H, font, load, comp, to_pil
+from ep4.common import A, W, H, REEL, font, load, comp, to_pil
 from ep4.timeline import T, TITLE
 from ep4 import cards, sheets
 
@@ -92,5 +99,81 @@ def main():
         print("clip: %d frames, %.2f s/frame -> %s" % (len(ns), (time.time() - t0) / len(ns), out))
 
 
+# ------------------------------------------------------------------ reel check sheet
+BLOCK = os.path.join(A, "blockouts")
+REEL_FRAMES = [(5.8, "03_s1_title"), (6.5, "03_s1_title"), (10.45, "03_s1_title"), (24.4, "08_w4_yellow_from_right"),
+               (25.5, "09_s4_reply"), (28.0, "09_s4_reply"), (29.85, "10_w5_yellow_slides_down"), (30.0, "10_w5_yellow_slides_down"),
+               (41.2, "13_w6_pink_from_left"), (44.0, "14_s6_make_what"), (47.0, "14_s6_make_what"), (48.5, "14_s6_make_what"),
+               (49.7, "15_w7_cream_from_right"), (53.0, "16_s7_cards_drop"), (56.5, "16_s7_cards_drop"),
+               (58.5, "17_s7_annotate_reply"), (61.0, "17_s7_annotate_reply"), (61.5, "18_s8_reply_home")]
+# (time, crop box, label): 1:1, so the type reads at its real size on a 1080-wide phone
+REEL_CROPS = [(6.5, (80, 385, 740, 575), "title tag 46 px"),
+              (28.0, (70, 540, 950, 900), "s4 prompt 44 px + reply 56 px"),
+              (48.5, (70, 650, 950, 1040), "s6 52 px, 'it' sweep, 76 px answer"),
+              (61.0, (60, 280, 960, 640), "s7 card 1: 28 px label, 40 px text, tapes"),
+              (61.0, (500, 660, 1080, 1000), "arrow at the right edge (x 926 limit)"),
+              (61.0, (60, 1120, 960, 1400), "s7 reply 60 px")]
+
+
+def overlay(im):
+    from ep4 import layout as L
+    d = ImageDraw.Draw(im, "RGBA")
+    x0, y0, x1, y1 = L.SAFE; d.rectangle([x0, y0, x1, y1], outline=(40, 220, 90, 255), width=3)
+    gx0, gy0, gx1, gy1 = L.GRID
+    for y in (gy0, gy1): d.line([(0, y), (W, y)], fill=(255, 150, 30, 255), width=3)
+    d.rectangle([960, 0, W, H], fill=(255, 60, 60, 40)); d.line([(926, 0), (926, H)], fill=(255, 60, 60, 160), width=1)
+    return im
+
+
+def checks():
+    """text boxes vs the safe box, the arrow vs x 926 (from the layer geometry, not the picture)"""
+    from ep4 import layout as L
+    from PIL import Image as I
+    sx0, sy0, sx1, sy1 = L.SAFE
+    def bbox(lay):
+        a = np.asarray(lay.getchannel("A")); ys, xs = np.nonzero(a > 8)
+        return (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+    def inside(b): return b[0] >= sx0 and b[1] >= sy0 and b[2] <= sx1 and b[3] <= sy1
+    res = []
+    lay = cards.title_reveal(2.0, 5.0); res.append(("title tag", bbox(lay)))
+    cards._history_assets()
+    for i, b in enumerate(cards.PAPER_BOX): res.append((f"s7 card {i + 1} paper", tuple(int(round(v)) for v in b)))
+    lay = I.new("RGBA", (W, H), (0, 0, 0, 0)); cards.ink_arrow(lay, cards.arrow_points(), 1.0, width=cards.S7["arrow_width"], head=cards.S7["arrow_head"])
+    ab = bbox(lay); res.append(("s7 arrow", ab))
+    for name, b in res: print(f"  {name:20s} {b}  {'inside safe box' if inside(b) else 'OUTSIDE SAFE BOX'}")
+    print(f"  arrow outermost x {ab[2] - 1} (limit 926): {'ok' if ab[2] - 1 <= 926 else 'TOO FAR'}")
+
+
+def main_reel():
+    from ep4 import video
+    TW_, TH_ = 360, 640
+    pairs, ours = [], {}
+    for t, bk in REEL_FRAMES:
+        t0 = time.time(); im = Image.fromarray(video.to_u8(video.frame(t))).convert("RGB"); dt = time.time() - t0
+        ours[t] = im
+        a = lab(overlay(im.copy()).resize((TW_, TH_), Image.LANCZOS), f"ours {t:.2f}s")
+        b = lab(Image.open(os.path.join(BLOCK, bk + ".png")).convert("RGB").resize((TW_, TH_), Image.LANCZOS), bk[:2])
+        pr = Image.new("RGB", (2 * TW_ + 4, TH_), (255, 255, 255)); pr.paste(a, (0, 0)); pr.paste(b, (TW_ + 4, 0)); pairs.append(pr)
+        print(f"  {t:6.2f} s  {dt:.2f} s")
+    per = 3; pw = pairs[0].width + 16
+    rows = [pairs[i:i + per] for i in range(0, len(pairs), per)]
+    crops = []
+    for t, (x0, y0, x1, y1), name in REEL_CROPS:
+        c = lab(ours[t].crop((x0, y0, x1, y1)), f"1:1 {name}"); crops.append(c)
+    SW = per * pw
+    hgt = len(rows) * (TH_ + 12) + sum(c.height + 12 for c in crops)
+    sheet = Image.new("RGB", (SW, hgt), (255, 255, 255)); y = 0
+    for r in rows:
+        for j, pr in enumerate(r): sheet.paste(pr, (j * pw, y))
+        y += TH_ + 12
+    x = 0; rowh = 0                      # crops flow left to right
+    for c in crops:
+        if x + c.width > SW: x = 0; y += rowh + 12; rowh = 0
+        sheet.paste(c, (x, y)); x += c.width + 12; rowh = max(rowh, c.height)
+    sheet = sheet.crop((0, 0, SW, y + rowh))
+    out = os.path.join(A, "check_cards.jpg"); sheet.save(out, quality=86); print("wrote", out)
+    checks()
+
+
 if __name__ == "__main__":
-    main()
+    main_reel() if REEL else main()

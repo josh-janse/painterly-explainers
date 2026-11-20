@@ -4,9 +4,11 @@
 
 a = outgoing frame, b = incoming frame (float32 RGB 0-1, H x W x 3), p = 0..1 through the wipe (eased inside).
     "left": b is revealed from the right, its torn left edge moving x = W -> 0 (w4, w7); both images static
-    "up":   b is revealed from the bottom, its torn top edge rising y = H -> 0 (w6); both images static
+    "right": the mirror of "left": b is revealed from the left, its torn right edge moving x = 0 -> W (reel w6)
+    "up":   b is revealed from the bottom, its torn top edge rising y = H -> 0 (landscape w6); both images static
     "down": a is the top sheet and slides down off the frame with its content, revealing b (static) (w5)
 The top sheet has a thin bright fibrous lip on its torn edge and casts a soft shadow on the sheet beneath.
+Which direction each wipe uses is per format: ep4/layout.py WIPES.
 """
 import numpy as np
 import scipy.ndimage as ndi
@@ -39,12 +41,18 @@ def _layers(d, ds, lip, shadow_a, shadow_s, shadow_off, lip_w=2.6, lip_a=0.45):
 
 def sheet(a, b, p, direction, seed):
     pe = ease(p)
-    prof, sprof, lip = torn_profile(H if direction == "left" else W, seed)
+    prof, sprof, lip = torn_profile(H if direction in ("left", "right") else W, seed)
     lipc = np.array([1.0, 0.985, 0.955], np.float32)
     if direction == "left":
         ex = W * (1 - pe)
         d = np.arange(W, dtype=np.float32)[None, :] - (ex + prof[:, None])
         ds = np.arange(W, dtype=np.float32)[None, :] - (ex + sprof[:, None])
+        top, lp, sh = _layers(d, ds, lip[:, None], 0.24, 10.0, 2.0)
+        under, over = a, b
+    elif direction == "right":
+        ex = W * pe
+        d = (ex - prof[:, None]) - np.arange(W, dtype=np.float32)[None, :]
+        ds = (ex - sprof[:, None]) - np.arange(W, dtype=np.float32)[None, :]
         top, lp, sh = _layers(d, ds, lip[:, None], 0.24, 10.0, 2.0)
         under, over = a, b
     elif direction == "up":

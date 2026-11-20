@@ -452,26 +452,34 @@ def ink_arrow(lay, pts, prog, seed=5, width=3.6, head=17 * F):
 
 
 # ------------------------------------------------------------------ s7, the history (§4.8.4, recovered)
-C1_ARGS = ([("r", "What can I cook tonight with eggs and spinach?")], 500 * F, 3, "YOUR FIRST LETTER")
-C2_ARGS = (["A spinach omelette.", "Wilt the spinach in butter, pour in three beaten eggs…"], 500 * F, -1.5, "HIS REPLY", True)
-C3_ARGS = ([("r", "Thanks! Can you make it without eggs?")], 500 * F, 1, "YOUR NEW LETTER")
-CARD_POS = [(110 * F - 40, 140 * F - 40), (150 * F - 40, 300 * F - 40), (125 * F - 40, 470 * F - 40)]
+S7 = L.S7
+S7_SPEC = card_spec(S7)            # None in landscape
+S7_SIZE = S7["size_arg"] or 22
+C1_ARGS = ([("r", "What can I cook tonight with eggs and spinach?")], S7["card_w"], S7["rots"][0], "YOUR FIRST LETTER")
+C2_ARGS = (["A spinach omelette.", "Wilt the spinach in butter, pour in three beaten eggs…"], S7["card_w"], S7["rots"][1], "HIS REPLY", True)
+C3_ARGS = ([("r", "Thanks! Can you make it without eggs?")], S7["card_w"], S7["rots"][2], "YOUR NEW LETTER")
+CARD_POS = S7["card_pos"]          # sprite top-left per card; reel: computed by _stack() (vertical stack, centred)
 ANS2 = "Without eggs? Try spinach and cheese on toast."
+ANS2_ORG = S7["ans2_xy"]           # reel: computed by _stack() (below the stack)
 CARDS = TAPES = ANC2 = ANC3 = None
 CARD_HL = {}
+PAPER_BOX = None                   # reel: rotated paper bbox per card (frame px)
 
 # each tape: (position along the card's top edge 0-1, angle relative to the card in degrees, seed). Centred so that
 # ~57 % of its width lies on the card and ~43 % on whatever is behind (backdrop, or the card above).
-TAPE_SPEC = [(0.46, 4.5, 1), (0.55, -5.0, 2), (0.80, 3.5, 3)]     # tape 3 sits right of "three beaten eggs…" so it covers no words
-TAPE_WH = (138, 40)            # px (not x F), a little larger than the v9 120 x 36 so it reads at 1080p
+TAPE_SPEC = S7["tape_spec"]        # landscape: tape 3 sits right of "three beaten eggs…" so it covers no words
+TAPE_WH = S7["tape_wh"]            # px (not x F); landscape a little larger than the v9 120 x 36 so it reads at 1080p
 TAPE_ON = 0.57                 # share of the tape's width on the card it holds
 TAPE_PAD = 30
 
-def _taped(c, args, seed, u, dang):
+def _card(i, **kw):
+    return card(*(C1_ARGS, C2_ARGS, C3_ARGS)[i], size=S7_SIZE, seed=i + 1, spec=S7_SPEC, **kw)
+
+def _taped(c, i, u, dang, seed):
     """the tape for one card as an RGBA sprite in the card image's own frame (offset by -TAPE_PAD): drawn on top of the
     card, straddling its top edge, with a very soft shadow on the side that is off the card only"""
-    _, rp, (M, w, h) = card(*args, size=22, seed=seed, anchors="geom")
-    rot = args[2]; tw, th = TAPE_WH
+    _, rp, (M, w, h) = _card(i, anchors="geom")
+    rot = (C1_ARGS, C2_ARGS, C3_ARGS)[i][2]; tw, th = TAPE_WH
     off = (TAPE_ON - 0.5) * th                                     # the strip's centre sits this far inside the top edge
     cx, cy = rp(M + u * w, M + off)
     tp = tape(tw, th, rot + dang, seed)
@@ -488,18 +496,43 @@ def _taped(c, args, seed, u, dang):
     rgb = (trgb * ta[..., None] + ink * (sh * (1 - ta))[..., None]) / np.maximum(al, 1e-6)[..., None]
     return Image.fromarray(np.dstack([np.clip(rgb, 0, 255), np.clip(al * 255, 0, 255)]).astype(np.uint8), "RGBA")
 
+def _stack():
+    """reel: the three cards stacked top to bottom (paper left edges S7["card_x"], each tucked S7["card_overlap"] px
+    under the one above), the new reply below card 3; cards + reply centred on S7["stack_cy"]. Sets CARD_POS,
+    PAPER_BOX and ANS2_ORG."""
+    global CARD_POS, PAPER_BOX, ANS2_ORG
+    fnt = font("serif_b", S7["ans2_px"])
+    nrep = len(wrap(ImageDraw.Draw(Image.new("RGBA", (8, 8))), ANS2, fnt, S7["ans2_measure"]))
+    def place(y_top):
+        y = y_top; pos, boxes = [], []
+        for i, c in enumerate(CARDS):
+            _, rp, (M, w, h) = _card(i, anchors="geom")
+            y -= S7["card_overlap"][i]
+            ox = S7["card_x"][i] - M - (c.width - (w + 2 * M)) / 2; oy = y - M - (c.height - (h + 2 * M)) / 2
+            cs = [rp(M, M), rp(M + w, M), rp(M + w, M + h), rp(M, M + h)]
+            pos.append((int(round(ox)), int(round(oy))))
+            boxes.append((min(ox + q[0] for q in cs), min(oy + q[1] for q in cs), max(ox + q[0] for q in cs), max(oy + q[1] for q in cs)))
+            y += h
+        org = (L.CARD_TYPE["ans2_x"], boxes[2][3] + S7["ans2_gap"])
+        bottom = org[1] + (nrep - 1) * S7["ans2_lh"] + S7["ans2_px"] * 1.2
+        return pos, boxes, org, bottom
+    pos, boxes, org, bottom = place(0)
+    y_top = int(S7["stack_cy"] - (bottom - boxes[0][1]) / 2)
+    CARD_POS, PAPER_BOX, ANS2_ORG = place(y_top)[:3]
+
 def _history_assets():
     global CARDS, TAPES, ANC2, ANC3
     if CARDS is None:
-        CARDS = [card(*C1_ARGS, size=22, seed=1), card(*C2_ARGS, size=22, seed=2), card(*C3_ARGS, size=22, seed=3)]
-        _, ANC2 = card(*C2_ARGS, size=22, seed=2, anchors=["omelette", "spinach"])
-        _, ANC3 = card(*C3_ARGS, size=22, seed=3, anchors=["it"])
-        TAPES = [_taped(c, a, sd, u, da) for c, a, (u, da, sd) in zip(CARDS, (C1_ARGS, C2_ARGS, C3_ARGS), TAPE_SPEC)]
+        CARDS = [_card(0), _card(1), _card(2)]
+        _, ANC2 = _card(1, anchors=["omelette", "spinach"])
+        _, ANC3 = _card(2, anchors=["it"])
+        TAPES = [_taped(c, i, u, da, sd) for i, (c, (u, da, sd)) in enumerate(zip(CARDS, TAPE_SPEC))]
+        if CARD_POS is None: _stack()
 
 def card_marked(i, p_it, p_om):
     key = (i, round(p_it, 2), round(p_om, 2))
     if key not in CARD_HL:
-        CARD_HL[key] = card(*C2_ARGS, size=22, seed=2, marks={"spinach omelette": p_om}) if i == 1 else card(*C3_ARGS, size=22, seed=3, marks={"it": p_it})
+        CARD_HL[key] = _card(1, marks={"spinach omelette": p_om}) if i == 1 else _card(2, marks={"it": p_it})
     return CARD_HL[key]
 
 def arrow_points():
@@ -507,6 +540,12 @@ def arrow_points():
     under his reply, round the card's right edge and back in to the end of "spinach omelette" """
     _history_assets()
     it = ANC3["it"]["top"]; om = ANC2["omelette"]["right"]
+    if S7["arrow_waypoints"] is not None:          # reel: the REEL_LAYOUT loop, rebuilt from the anchors
+        a0 = (CARD_POS[2][0] + it[0], CARD_POS[2][1] + it[1] - 12)
+        a3 = (CARD_POS[1][0] + om[0] + 22, CARD_POS[1][1] + om[1])
+        R = PAPER_BOX[1][2]; band = PAPER_BOX[2][1] - 4          # card 2's right edge; the clear strip above card 3
+        return (a0, (a0[0] + 8, a0[1] - 34), (a0[0] + 70, band - 10), (R - 40, band - 12), (R + 30, band - 34),
+                (R + 56, (band + a3[1]) / 2), (R + 40, a3[1] + 20), (R + 6, a3[1] + 6), (a3[0] + 70, a3[1] + 2), a3)
     a0 = (CARD_POS[2][0] + it[0], CARD_POS[2][1] + it[1] - 10)      # rises straight out of the middle of "it"
     a3 = (CARD_POS[1][0] + om[0] + 16, CARD_POS[1][1] + om[1])
     R = CARD_POS[1][0] + CARDS[1].width - 20
@@ -541,10 +580,10 @@ def scene_history(t, static=False):
         lay.alpha_composite(cc, (int(x), int(y)))
         lay.alpha_composite(tp, (int(x) - int(round(TAPE_PAD * sx)), int(y) - int(round(TAPE_PAD * sy))))
     if p_ar > 0:      # from "it" in the new letter, round to the end of "spinach omelette" in his reply
-        ink_arrow(lay, arrow_points(), ease_io(p_ar))
+        ink_arrow(lay, arrow_points(), ease_io(p_ar), width=S7["arrow_width"], head=S7["arrow_head"])
     if static or lt > ANS2_DOTS:
-        fnt = font("serif_b", 34 * F); org = (760 * F, 300 * F)
+        fnt = font("serif_b", S7["ans2_px"]); org = ANS2_ORG; mw, lh = S7["ans2_measure"], S7["ans2_lh"]
         m = len(ANS2) if static else int((lt - ANS2_TYPE[0]) * ANS2_TYPE[1])
-        if not static and lt < ANS2_TYPE[0]: text_block(lay, org, "…", fnt, 420 * F, 34 * F * 1.35)
-        elif m > 0: text_block(lay, org, ANS2, fnt, 420 * F, 34 * F * 1.35, nchars=m)
+        if not static and lt < ANS2_TYPE[0]: text_block(lay, org, "…", fnt, mw, lh)
+        elif m > 0: text_block(lay, org, ANS2, fnt, mw, lh, nchars=m)
     return _f32(comp(load("paper_cream.jpg"), lay))
