@@ -151,7 +151,7 @@ REEL = dict(
             lh_em=1.42, para_em=0.55, rots=(3, -1.5, 1),
             card_pos=None,                       # computed: stack + reply centred on y 860 -> card 1 top 339
             card_x=(100, 140, 114), card_overlap=(0, 14, 16), stack_cy=860,
-            tape_wh=(156, 46), tape_spec=[(0.43, 6.0, 1), (0.50, -8.0, 2), (0.57, 4.0, 3)],
+            tape_wh=(156, 46), tape_spec=[(0.43, 6.0, 1), (0.62, -8.0, 2), (0.36, 4.0, 3)],   # clear of the words above and the arrow
             arrow_width=5, arrow_head=26,
             arrow_waypoints=[(616, 969), (624, 935), (686, 864), (824, 862), (894, 840), (926, 785), (908, 717),
                              (870, 703), (656, 699), (586, 697)],          # outermost x 926; rebuild from anchors
