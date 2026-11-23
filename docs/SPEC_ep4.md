@@ -1058,7 +1058,7 @@ it: `hb = prompt_box(...)`).
 #### 4.8.1 `rough()` — static edge roughness (*recovered*)
 
 ```python
-HL = (245, 212, 74)                      # the one accent: Vox-ish marker yellow
+HL = (245, 212, 74)                      # the one accent: marker yellow
 def rough(im, amp=1.5, size=12, seed=0, fine=0.3):
     """static turbulent displacement on an RGBA image, so flat shapes read as cut or printed rather than vector-perfect"""
     a = np.asarray(im, np.float32); h, w = a.shape[:2]

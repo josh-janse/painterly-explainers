@@ -31,7 +31,7 @@ SAFE = (60, 250, 960, 1470) if REEL else (0, 0, W, H)
 # ---- palette (§1.5) ----
 INK = (46, 44, 45)                         # text, prompt-box outline, arrow, dark tag bg
 TAG_LIGHT = (238, 238, 236)                # title tag background
-HL = (245, 212, 74)                        # the one accent: Vox-ish marker yellow
+HL = (245, 212, 74)                        # the one accent: marker yellow
 CARD_PAPER = (242, 233, 217)
 CARD_PAPER_REPLY = (248, 244, 236)
 CARD_LABEL = (109, 106, 111)
