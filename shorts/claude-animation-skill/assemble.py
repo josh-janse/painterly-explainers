@@ -1,5 +1,6 @@
 """Silent preview of the Short: Claude's beats in order, placeholders for Josh's hook, step 2 and ending,
 and the current voice-over lines burned in at the bottom (preview only) so the timing can be checked."""
+import os
 import subprocess
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
@@ -60,6 +61,7 @@ def vo_caption(im, text):
         d.text((60, y + 30 + 46 * j), ln, font=f, fill=(250, 248, 244))
     return im
 
+SHOW_VO = os.environ.get("PREVIEW_VO") == "1"
 w = Writer(f"{OUT}/preview_silent.mp4")
 offsets, t = [], 0.0
 for src, secs, vo in segs:
@@ -67,13 +69,13 @@ for src, secs, vo in segs:
     gen = placeholder(*src[1:], n) if isinstance(src, tuple) else frames_of(src, n)
     k = 0
     for im in gen:
-        w.add(vo_caption(im, vo)); k += 1
+        w.add(vo_caption(im, vo) if SHOW_VO else im); k += 1
     while k < n:   # pad if a clip runs short
-        w.add(vo_caption(im, vo)); k += 1
+        w.add(vo_caption(im, vo) if SHOW_VO else im); k += 1
 print("frames", w.close(), "seconds", t)
 sound_at = offsets[6]
 subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", f"{OUT}/preview_silent.mp4", "-i", f"{B}/s6_sound.wav",
                 "-filter_complex", f"[1:a]adelay={int(sound_at*1000)}|{int(sound_at*1000)},apad[a]", "-map", "0:v", "-map", "[a]",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
-                f"{OUT}/short_preview_v1.mp4"], check=True)
-print("wrote short_preview_v1.mp4")
+                f"{OUT}/short_preview_v2.mp4"], check=True)
+print("wrote short_preview_v2.mp4")

@@ -60,6 +60,10 @@ def step_tag(img, text, p=1.0, x=72, y=300, px=40, dark=True):
     img.alpha_composite(tag.crop((0, 0, vis, bh)), (x, y))
     return img
 
+def tag_p(i, start=3, hold=33):
+    """Step labels wipe in, sit for about 1.4 s, then wipe out, so they never compete with the picture."""
+    return min(ease((i - start) / 6), ease((start + hold - i) / 6))
+
 def noise_field(shape, sigma, seed):
     r = np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
     r = ndi.gaussian_filter(r, sigma)

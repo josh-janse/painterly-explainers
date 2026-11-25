@@ -4,7 +4,7 @@ import subprocess
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.io import wavfile
-from lib import W, H, FPS, INK, HL, PAPER, Writer, ease, font, step_tag, draw_tracked, REPO, OUT
+from lib import tag_p, W, H, FPS, INK, HL, PAPER, Writer, ease, font, step_tag, draw_tracked, REPO, OUT
 
 A = f"{OUT}/audio"
 def env(name, hop):
@@ -26,7 +26,7 @@ s0 = int(np.argmax(score[: len(score) - win]))
 T0 = s0 * HOP_S
 print("window starts at", round(T0, 2), "s")
 
-lanes = [("Voice", vo, INK, 220), ("Effects · real recordings", fx, (214, 120, 40), 200), ("Sea", amb, (120, 128, 140), 120)]
+lanes = [("Voice", vo, INK, 220), ("Effects · real recordings", fx, (214, 120, 40), 200)]
 PX_PER_S = 360                                     # scroll speed: the playhead sits at x 540
 BAR = PX_PER_S * HOP_S
 tex = Image.open(f"{REPO}/engine/tex/Paper001_2K-JPG_Color.jpg").convert("L").resize((W, H))
@@ -35,8 +35,9 @@ bg = Image.fromarray(np.clip(np.array(PAPER, np.float32)[None, None] * (1 + t[..
 
 w = Writer(f"{OUT}/beats/s6_sound.mp4")
 N = 5 * FPS
-ys = [580, 900, 1190]
+ys = [700, 1060]
 for i in range(N):
+    I = i
     now = T0 + i / FPS
     im = bg.copy(); d = ImageDraw.Draw(im)
     for (label, e, col, amp), yc in zip(lanes, ys):
@@ -49,8 +50,8 @@ for i in range(N):
             played = x <= 540
             c = col if played else tuple(int(v * 0.35 + 235 * 0.65) for v in col)
             d.rounded_rectangle((x, yc - h / 2, x + BAR * 0.62, yc + h / 2), radius=2, fill=c)
-    d.rectangle((539, 410, 542, 1290), fill=INK)
-    step_tag(im, "Step 6 · sound", p=(i - 3) / 6)
+    d.rectangle((539, 520, 542, 1220), fill=INK)
+    step_tag(im, "Step 6 · sound", p=tag_p(I))
     w.add(im)
 print("frames", w.close())
 subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{T0:.3f}", "-t", "5", "-i", f"{A}/mix.wav", "-c:a", "pcm_s16le",

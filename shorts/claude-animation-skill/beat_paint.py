@@ -2,7 +2,7 @@
 import glob
 import numpy as np
 from PIL import Image
-from lib import W, H, FPS, PAPER, Writer, ease, noise_field, push, step_tag, REPO, OUT
+from lib import tag_p, W, H, FPS, PAPER, Writer, ease, noise_field, push, step_tag, REPO, OUT
 
 snaps = sorted(glob.glob(f"{OUT}/tl/*.jpg"))
 load = lambda i: np.asarray(Image.open(snaps[i]).convert("RGB"), np.float32)
@@ -38,13 +38,15 @@ for k in range(1, len(keys)):
 final = keys[-1][0]
 hold = TOTAL - len(frames)
 for i, f in enumerate(frames):
+    I = i
     im = Image.fromarray(np.clip(f, 0, 255).astype(np.uint8)).convert("RGBA")
-    step_tag(im, "Step 4 · paint", p=(i - 4) / 6)
+    step_tag(im, "Step 4 · paint", p=tag_p(I))
     w.add(im)
 fin = Image.fromarray(final.astype(np.uint8)).convert("RGBA")
 for i in range(hold):
+    I = len(frames) + i
     z = 1 + 0.045 * ease(i / max(hold - 1, 1))
     im = push(fin, z, 680, 980)
-    step_tag(im, "Step 4 · paint", p=1)
+    step_tag(im, "Step 4 · paint", p=tag_p(I))
     w.add(im)
 print("frames", w.close())

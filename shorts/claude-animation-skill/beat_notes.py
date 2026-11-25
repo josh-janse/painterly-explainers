@@ -3,7 +3,7 @@ with a ringed target and a version counter ticking from v1 to v9 (8 s)."""
 import math
 import numpy as np
 from PIL import Image, ImageDraw
-from lib import W, H, FPS, INK, HL, CARD, Writer, ease, font, step_tag, push, OUT
+from lib import tag_p, W, H, FPS, INK, HL, CARD, Writer, ease, font, step_tag, push, OUT
 
 P = f"{OUT}/plates"
 dusk = Image.open(f"{P}/dusk.jpg").convert("RGBA")
@@ -46,6 +46,7 @@ cards = [card(n[1], r) for n, r in zip(notes, (-1.6, 1.2, -1.0, 1.5))]
 SEG = 48
 w = Writer(f"{OUT}/beats/s5_notes.mp4")
 for i in range(SEG * len(notes)):
+    I = i
     k, j = divmod(i, SEG)
     plate, _, (cx, cy), (rx, ry), cy_card = notes[k]
     z = 1 + 0.05 * ease(j / (SEG - 1))
@@ -58,7 +59,7 @@ for i in range(SEG * len(notes)):
     d = ImageDraw.Draw(im)
     pr = ease((j - 10) / 12)
     if pr > 0:
-        d.arc((tx - rx * z, ty - ry * z, tx + rx * z, ty + ry * z), -100, -100 + 360 * pr, fill=HL, width=8)
+        d.arc((tx - rx * z, ty - ry * z, tx + rx * z, ty + ry * z), -100, -100 + 360 * pr, fill=HL, width=6)
     c = cards[k]
     pc = ease(j / 8)
     if pc > 0:
@@ -67,8 +68,6 @@ for i in range(SEG * len(notes)):
         if pc < 1:
             a = np.asarray(layer).copy(); a[..., 3] = (a[..., 3] * pc).astype(np.uint8); layer = Image.fromarray(a)
         im.alpha_composite(layer)
-    v = 1 + min(8, int(8 * i / (SEG * len(notes) - 6)))
-    step_tag(im, "Step 5 · notes", p=(i - 3) / 6)
-    step_tag(im, f"v{v} of 9", p=1, x=72, y=1380, px=34, dark=False)
+    step_tag(im, "Step 5 · notes", p=tag_p(I))
     w.add(im)
 print("frames", w.close())

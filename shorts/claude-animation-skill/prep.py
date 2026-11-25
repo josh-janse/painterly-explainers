@@ -2,12 +2,14 @@
 
   paint   9:16 dusk plate, saving the canvas after every painting pass  -> out/tl/*.jpg, out/plates/dusk.jpg
   stems   Episode 4's voice, effects and sea stems, no music track       -> out/audio/mix*.wav
+  clean   the 9:16 flat-shape blockouts without guides, labels or zones   -> out/clean_blockouts/NN_*.png
 
 Each step writes a patched copy of an ep4 module next to the original (it has to sit in the ep4 package for its
 imports), runs it, and deletes it again.
 
     python3 prep.py paint
     python3 prep.py stems
+    python3 prep.py clean
 """
 import os
 import subprocess
@@ -60,5 +62,25 @@ def stems():
     (OUT / "audio").mkdir(parents=True, exist_ok=True)
     run_patched("audio.py", "_audio_nomusic.py", edit, [str(OUT / "audio" / "mix.wav")], {"STEMS": "1"})
 
+def clean():
+    src = (REPO / "scripts" / "reel_blockouts.py").read_text()
+    swaps = [
+        ('def overlays(im, num, when, caption, show_caption=True):\n',
+         'def overlays(im, num, when, caption, show_caption=True):\n    return im\ndef _overlays(im, num, when, caption, show_caption=True):\n'),
+        ('def guide_arrow(dr, pts, fill=GUIDE, width=5):\n', 'def guide_arrow(dr, pts, fill=GUIDE, width=5):\n    return\ndef _ga(dr, pts, fill=GUIDE, width=5):\n'),
+        ('def guide_label(dr, xy, text, fill=GUIDE, px=28, anchor="la"):\n',
+         'def guide_label(dr, xy, text, fill=GUIDE, px=28, anchor="la"):\n    return\ndef _gl(dr, xy, text, fill=GUIDE, px=28, anchor="la"):\n'),
+        ('OUT = os.path.join(ROOT, "out", "ep4_reel")', f'OUT = {str(OUT / "clean")!r}'),
+    ]
+    for a, b in swaps:
+        assert a in src, f"reel_blockouts.py changed: {a[:40]}"
+        src = src.replace(a, b, 1)
+    tmp = REPO / "scripts" / "_clean_blockouts.py"
+    tmp.write_text(src)
+    try:
+        subprocess.run([sys.executable, str(tmp)], cwd=REPO, check=True)
+    finally:
+        tmp.unlink(missing_ok=True)
+
 if __name__ == "__main__":
-    {"paint": paint, "stems": stems}[sys.argv[1]]()
+    {"paint": paint, "stems": stems, "clean": clean}[sys.argv[1]]()

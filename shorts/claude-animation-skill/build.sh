@@ -13,7 +13,7 @@ mkdir -p "$HERE/out/beats" "$HERE/out/plates"
 cd "$HERE"
 python3 prep.py paint                                                    # dusk plate + a snapshot per pass
 (cd "$REPO" && EP4_FORMAT=reel python3 -m ep4.backdrops uncle --out "$HERE/out/plates")
-(cd "$REPO" && python3 scripts/reel_blockouts.py)                        # flat 9:16 frames for step 3
+python3 prep.py clean                                                    # flat 9:16 frames for step 3, no guides
 python3 prep.py stems                                                    # voice, effects, sea (no music)
 
 python3 beat_study.py      # step 1, 6 s
